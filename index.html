@@ -480,6 +480,60 @@
     box-shadow: 0 0 0 1px rgba(46,196,163,0.25);
   }
 
+  /* SI/HI safety warning */
+  .safety-warning {
+    background: rgba(255,180,50,0.08);
+    border: 0.5px solid rgba(255,180,50,0.3);
+    border-radius: 8px;
+    padding: 0.7rem 1rem;
+    font-size: 0.82rem;
+    color: #ffd080;
+    display: none;
+    align-items: center;
+    gap: 0.6rem;
+    line-height: 1.4;
+  }
+  .safety-warning.visible { display: flex; }
+
+  /* CPT code row */
+  .cpt-row {
+    display: none;
+    align-items: center;
+    gap: 0.75rem;
+    background: var(--card-bg);
+    border: 0.5px solid var(--card-border);
+    border-radius: 8px;
+    padding: 0.6rem 1rem;
+    flex-wrap: wrap;
+  }
+  .cpt-row.visible { display: flex; }
+  .cpt-label {
+    font-size: 0.65rem;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: var(--teal);
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .cpt-chip {
+    font-family: 'DM Mono', monospace;
+    font-size: 0.82rem;
+    color: var(--cream);
+    background: rgba(255,255,255,0.06);
+    border: 0.5px solid var(--card-border);
+    border-radius: 5px;
+    padding: 0.2rem 0.55rem;
+    cursor: pointer;
+    transition: border-color 0.2s, color 0.2s;
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    user-select: all;
+  }
+  .cpt-chip:hover { border-color: var(--teal); color: var(--teal); }
+  .cpt-chip-label { font-family: 'Outfit', sans-serif; font-size: 0.68rem; color: var(--muted); letter-spacing: 0.04em; }
+  .cpt-sep { color: var(--muted); font-size: 0.75rem; }
+
   .hidden { display: none !important; }
 
   @media (max-width: 600px) {
@@ -550,6 +604,10 @@
         <span class="cursor hidden" id="transcriptCursor"></span>
       </div>
       <div class="error-msg" id="errorMsg"></div>
+      <div class="safety-warning" id="safetyWarning">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="flex-shrink:0"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+        SI/HI not documented in transcript — confirm risk status before finalizing note
+      </div>
       <button class="generate-btn" id="generateBtn" onclick="generateSOAP()">Generate SOAP Note</button>
     </div>
 
@@ -562,6 +620,10 @@
           </svg>
           Copy
         </button>
+      </div>
+      <div class="cpt-row" id="cptRow">
+        <span class="cpt-label">CPT</span>
+        <span id="cptChips"></span>
       </div>
       <div class="soap-card">
         <div class="soap-field">
@@ -728,6 +790,7 @@ function stopRecording() {
   document.getElementById('waveform').classList.remove('active');
   document.querySelectorAll('.bar').forEach(b => b.style.height = '4px');
   document.getElementById('transcriptCursor').classList.add('hidden');
+  checkSafetyDoc();
 }
 
 function updateTranscriptDisplay(text) {
@@ -753,7 +816,18 @@ async function generateSOAP() {
 Return ONLY a JSON object with exactly these four keys: "S", "O", "A", "P"
 
 - S (Subjective): Patient's reported symptoms, concerns, history in their own words. Include chief complaint, HPI, and any relevant personal/social history mentioned.
-- O (Objective): Any objective findings mentioned — mental status exam observations, vital signs, appearance, behavior, affect, speech, thought process, cognition. If not mentioned, note "Not documented in this session."
+- O (Objective): Format as a structured Mental Status Exam with each field on its own line:
+  Appearance: [dress, grooming]
+  Behavior: [eye contact, psychomotor, cooperation]
+  Speech: [rate, rhythm, volume]
+  Mood: [patient's own words in quotes]
+  Affect: [range, intensity, congruence with mood]
+  Thought Process: [linear / tangential / circumstantial / etc]
+  Thought Content: [SI/HI/AVH/delusions — explicitly note denial if not mentioned]
+  Cognition: [orientation, memory, concentration]
+  Insight: [good / fair / poor]
+  Judgment: [good / fair / poor]
+  Use only information in the transcript. Write "Not documented" for any field not mentioned.
 - A (Assessment): Clinical impression, working diagnosis or differential, and any changes from prior sessions if mentioned.
 - P (Plan): Treatment plan, medication changes, referrals, follow-up timeline, psychotherapy approach, patient instructions.
 
@@ -796,6 +870,7 @@ Respond with only the JSON object, no markdown, no explanation.`;
     document.getElementById('soapP').textContent = parsed.P || '—';
     soapData = parsed;
 
+    showCPT();
     document.getElementById('soapSection').classList.add('visible');
     document.getElementById('soapSection').scrollIntoView({ behavior: 'smooth', block: 'start' });
     document.getElementById('statusDot').className = 'status-dot done';
@@ -807,6 +882,38 @@ Respond with only the JSON object, no markdown, no explanation.`;
     btn.innerHTML = 'Generate SOAP Note';
     btn.classList.add('ready');
   }
+}
+
+const SAFETY_TERMS = ['suicid','self-harm','self harm','homicid','ideation','hurt himself','hurt herself','hurt themselves','kill himself','kill herself','harm to self','harm to others',' si ',' hi ','si/hi','no si','denies si'];
+
+function checkSafetyDoc() {
+  const lower = transcript.toLowerCase();
+  const found = SAFETY_TERMS.some(t => lower.includes(t));
+  const warning = document.getElementById('safetyWarning');
+  if (!found && transcript.trim().length > 30) {
+    warning.classList.add('visible');
+  } else {
+    warning.classList.remove('visible');
+  }
+}
+
+function showCPT() {
+  if (timerSeconds === 0) return;
+  const min = Math.floor(timerSeconds / 60);
+  let pairs;
+  if (min < 16)      pairs = [['99212','Brief E&M']];
+  else if (min < 38) pairs = [['90832','30 min therapy'],['99213','Med management']];
+  else if (min < 53) pairs = [['90834','45 min therapy'],['99214','Med management']];
+  else               pairs = [['90837','60 min therapy'],['99215','Med management']];
+
+  const chips = pairs.map(([ code, label ], i) =>
+    (i > 0 ? '<span class="cpt-sep">·</span>' : '') +
+    `<span class="cpt-chip" onclick="navigator.clipboard.writeText('${code}')" title="Click to copy">` +
+    `${code}<span class="cpt-chip-label">${label}</span></span>`
+  ).join('');
+
+  document.getElementById('cptChips').innerHTML = chips;
+  document.getElementById('cptRow').classList.add('visible');
 }
 
 function copySOAP() {
@@ -851,6 +958,8 @@ function newSession() {
   document.getElementById('transcriptSection').classList.remove('visible');
   document.getElementById('soapSection').classList.remove('visible');
   ['soapS','soapO','soapA','soapP'].forEach(id => document.getElementById(id).textContent = '');
+  document.getElementById('cptRow').classList.remove('visible');
+  document.getElementById('safetyWarning').classList.remove('visible');
   document.getElementById('generateBtn').classList.remove('ready');
   document.getElementById('recordLabel').textContent = 'Tap to begin session';
   document.getElementById('statusDot').className = 'status-dot';
