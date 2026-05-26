@@ -160,6 +160,7 @@ Respond with only the JSON object, no markdown, no explanation.`;
 
 async function generateSOAP() {
   if (!transcript.trim()) return;
+  if (isRecording) stopRecording();
 
   const btn = document.getElementById('generateBtn');
   btn.disabled = true;
