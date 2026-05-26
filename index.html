@@ -438,6 +438,48 @@
   }
   .key-save-btn:hover { background: #3dd6b5; }
 
+  .soap-field-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .copy-section-btn {
+    background: transparent;
+    border: none;
+    color: var(--muted);
+    cursor: pointer;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 0.68rem;
+    font-family: 'Outfit', sans-serif;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    transition: color 0.2s, background 0.2s;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    opacity: 0;
+    transition: opacity 0.2s, color 0.2s, background 0.2s;
+  }
+  .soap-field:hover .copy-section-btn { opacity: 1; }
+  .copy-section-btn:hover { color: var(--teal); background: var(--teal-glow); }
+  .copy-section-btn.copied { color: var(--teal); opacity: 1; }
+
+  .soap-field-content[contenteditable="true"] {
+    outline: none;
+    border-radius: 4px;
+    padding: 4px 6px;
+    margin: -4px -6px;
+    cursor: text;
+    transition: background 0.2s, box-shadow 0.2s;
+  }
+  .soap-field-content[contenteditable="true"]:hover { background: rgba(255,255,255,0.03); }
+  .soap-field-content[contenteditable="true"]:focus {
+    background: rgba(255,255,255,0.05);
+    box-shadow: 0 0 0 1px rgba(46,196,163,0.25);
+  }
+
   .hidden { display: none !important; }
 
   @media (max-width: 600px) {
@@ -523,20 +565,44 @@
       </div>
       <div class="soap-card">
         <div class="soap-field">
-          <div class="soap-field-label">S — Subjective</div>
-          <div class="soap-field-content" id="soapS"></div>
+          <div class="soap-field-header">
+            <div class="soap-field-label">S — Subjective</div>
+            <button class="copy-section-btn" onclick="copySection('soapS', this)">
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+              Copy
+            </button>
+          </div>
+          <div class="soap-field-content" id="soapS" contenteditable="true"></div>
         </div>
         <div class="soap-field">
-          <div class="soap-field-label">O — Objective</div>
-          <div class="soap-field-content" id="soapO"></div>
+          <div class="soap-field-header">
+            <div class="soap-field-label">O — Objective</div>
+            <button class="copy-section-btn" onclick="copySection('soapO', this)">
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+              Copy
+            </button>
+          </div>
+          <div class="soap-field-content" id="soapO" contenteditable="true"></div>
         </div>
         <div class="soap-field">
-          <div class="soap-field-label">A — Assessment</div>
-          <div class="soap-field-content" id="soapA"></div>
+          <div class="soap-field-header">
+            <div class="soap-field-label">A — Assessment</div>
+            <button class="copy-section-btn" onclick="copySection('soapA', this)">
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+              Copy
+            </button>
+          </div>
+          <div class="soap-field-content" id="soapA" contenteditable="true"></div>
         </div>
         <div class="soap-field">
-          <div class="soap-field-label">P — Plan</div>
-          <div class="soap-field-content" id="soapP"></div>
+          <div class="soap-field-header">
+            <div class="soap-field-label">P — Plan</div>
+            <button class="copy-section-btn" onclick="copySection('soapP', this)">
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+              Copy
+            </button>
+          </div>
+          <div class="soap-field-content" id="soapP" contenteditable="true"></div>
         </div>
       </div>
       <button class="new-session-btn" onclick="newSession()">+ New Session</button>
@@ -744,8 +810,12 @@ Respond with only the JSON object, no markdown, no explanation.`;
 }
 
 function copySOAP() {
-  if (!soapData) return;
-  const text = `SOAP NOTE\n\nSUBJECTIVE\n${soapData.S}\n\nOBJECTIVE\n${soapData.O}\n\nASSESSMENT\n${soapData.A}\n\nPLAN\n${soapData.P}`;
+  const S = document.getElementById('soapS').textContent;
+  const O = document.getElementById('soapO').textContent;
+  const A = document.getElementById('soapA').textContent;
+  const P = document.getElementById('soapP').textContent;
+  if (!S && !O && !A && !P) return;
+  const text = `SOAP NOTE\n\nSUBJECTIVE\n${S}\n\nOBJECTIVE\n${O}\n\nASSESSMENT\n${A}\n\nPLAN\n${P}`;
   navigator.clipboard.writeText(text).then(() => {
     const btn = document.getElementById('copyBtn');
     btn.classList.add('copied');
@@ -754,6 +824,19 @@ function copySOAP() {
       btn.classList.remove('copied');
       btn.innerHTML = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg> Copy`;
     }, 2500);
+  });
+}
+
+function copySection(sectionId, btnEl) {
+  const text = document.getElementById(sectionId).textContent.trim();
+  if (!text || text === '—') return;
+  navigator.clipboard.writeText(text).then(() => {
+    btnEl.classList.add('copied');
+    btnEl.innerHTML = `<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="20 6 9 17 4 12"/></svg> Copied`;
+    setTimeout(() => {
+      btnEl.classList.remove('copied');
+      btnEl.innerHTML = `<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg> Copy`;
+    }, 2000);
   });
 }
 
@@ -767,6 +850,7 @@ function newSession() {
   document.getElementById('transcriptPlaceholder').style.display = '';
   document.getElementById('transcriptSection').classList.remove('visible');
   document.getElementById('soapSection').classList.remove('visible');
+  ['soapS','soapO','soapA','soapP'].forEach(id => document.getElementById(id).textContent = '');
   document.getElementById('generateBtn').classList.remove('ready');
   document.getElementById('recordLabel').textContent = 'Tap to begin session';
   document.getElementById('statusDot').className = 'status-dot';
