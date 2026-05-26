@@ -71,6 +71,13 @@ function startRecording() {
     if (e.error !== 'no-speech') showError('Microphone error: ' + e.error);
   };
 
+  recognition.onend = () => {
+    if (isRecording) {
+      finalTranscript = transcript;
+      recognition.start();
+    }
+  };
+
   recognition.start();
   isRecording = true;
 
@@ -340,7 +347,7 @@ function saveCurrentSession() {
     }
   };
   sessions.unshift(session);
-  if (sessions.length > 50) sessions = sessions.slice(0, 50);
+  if (sessions.length > 100) sessions = sessions.slice(0, 100);
   localStorage.setItem('scribe_sessions', JSON.stringify(sessions));
   renderSidebar();
 }
