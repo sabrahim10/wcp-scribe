@@ -42,9 +42,118 @@
       var(--navy);
   }
 
+  .shell {
+    display: flex;
+    min-height: 100vh;
+  }
+
+  .sidebar {
+    width: 220px;
+    flex-shrink: 0;
+    background: rgba(255,255,255,0.015);
+    border-right: 0.5px solid var(--card-border);
+    display: flex;
+    flex-direction: column;
+    position: sticky;
+    top: 0;
+    height: 100vh;
+    overflow: hidden;
+  }
+
+  .sidebar-header {
+    padding: 1.4rem 1rem 0.75rem;
+    font-size: 0.65rem;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: var(--teal);
+    font-weight: 600;
+    border-bottom: 0.5px solid var(--card-border);
+    flex-shrink: 0;
+  }
+
+  .session-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 0.4rem 0;
+  }
+
+  .session-item {
+    padding: 0.7rem 1rem;
+    cursor: pointer;
+    border-bottom: 0.5px solid rgba(255,255,255,0.04);
+    transition: background 0.15s;
+  }
+  .session-item:hover { background: rgba(255,255,255,0.04); }
+  .session-item.active { background: var(--teal-glow); border-left: 2px solid var(--teal); }
+
+  .session-item-meta {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 3px;
+  }
+
+  .session-item-date {
+    font-size: 0.7rem;
+    color: var(--cream);
+    font-weight: 400;
+  }
+
+  .session-item-dur {
+    font-size: 0.64rem;
+    color: var(--teal);
+    font-family: 'DM Mono', monospace;
+  }
+
+  .session-item-preview {
+    font-size: 0.7rem;
+    color: var(--muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-family: 'DM Mono', monospace;
+  }
+
+  .session-empty {
+    padding: 1.2rem 1rem;
+    font-size: 0.75rem;
+    color: var(--muted);
+    line-height: 1.5;
+    text-align: center;
+  }
+
+  .viewing-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: var(--teal-glow);
+    border: 0.5px solid rgba(46,196,163,0.2);
+    border-radius: 8px;
+    padding: 0.6rem 1rem;
+    font-size: 0.8rem;
+    color: var(--teal);
+    gap: 1rem;
+  }
+
+  .viewing-banner-back {
+    background: transparent;
+    border: 0.5px solid rgba(46,196,163,0.3);
+    border-radius: 5px;
+    color: var(--teal);
+    padding: 0.25rem 0.75rem;
+    font-size: 0.74rem;
+    font-family: 'Outfit', sans-serif;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: background 0.2s;
+    flex-shrink: 0;
+  }
+  .viewing-banner-back:hover { background: rgba(46,196,163,0.1); }
+
   .app {
+    flex: 1;
+    min-width: 0;
     max-width: 860px;
-    margin: 0 auto;
     padding: 2.5rem 2rem 4rem;
     display: flex;
     flex-direction: column;
@@ -536,7 +645,8 @@
 
   .hidden { display: none !important; }
 
-  @media (max-width: 600px) {
+  @media (max-width: 700px) {
+    .sidebar { display: none; }
     .app { padding: 1.5rem 1rem 3rem; }
     .wordmark-title { font-size: 1.5rem; }
     .record-btn { width: 70px; height: 70px; }
@@ -544,6 +654,15 @@
 </style>
 </head>
 <body>
+<div class="shell">
+
+<aside class="sidebar" id="sidebar">
+  <div class="sidebar-header">Sessions</div>
+  <div class="session-list" id="sessionList">
+    <div class="session-empty">Sessions appear here after you click New Session</div>
+  </div>
+</aside>
+
 <div class="app">
 
   <header>
@@ -567,7 +686,12 @@
   <!-- Main interface -->
   <div id="mainInterface" class="hidden">
 
-    <div class="record-section">
+    <div class="viewing-banner hidden" id="viewingBanner">
+      <span id="viewingBannerDate">Past session</span>
+      <button class="viewing-banner-back" onclick="exitViewMode()">← Back to session</button>
+    </div>
+
+    <div class="record-section" id="recordSection">
       <div class="record-btn-wrap">
         <div class="pulse-ring" id="ring1"></div>
         <div class="pulse-ring" id="ring2"></div>
@@ -672,7 +796,8 @@
 
   </div>
 
-</div>
+</div><!-- end .app -->
+</div><!-- end .shell -->
 
 <script>
 let apiKey = localStorage.getItem('scribe_key') || '';
@@ -683,6 +808,9 @@ let timerInterval = null;
 let timerSeconds = 0;
 let waveInterval = null;
 let soapData = null;
+let sessions = JSON.parse(localStorage.getItem('scribe_sessions') || '[]');
+let viewMode = false;
+let viewSnapshot = null;
 
 function saveKey() {
   const val = document.getElementById('apiKeyInput').value.trim();
@@ -700,6 +828,7 @@ if (apiKey) {
   document.getElementById('setupCard').classList.add('hidden');
   document.getElementById('mainInterface').classList.remove('hidden');
 }
+renderSidebar();
 
 function toggleRecord() {
   if (!isRecording) startRecording();
@@ -874,6 +1003,8 @@ Respond with only the JSON object, no markdown, no explanation.`;
     document.getElementById('soapSection').classList.add('visible');
     document.getElementById('soapSection').scrollIntoView({ behavior: 'smooth', block: 'start' });
     document.getElementById('statusDot').className = 'status-dot done';
+    document.getElementById('recordBtn').disabled = true;
+    document.getElementById('recordLabel').textContent = 'Note generated — click New Session to continue';
 
   } catch(err) {
     showError('Error generating note: ' + err.message);
@@ -948,6 +1079,8 @@ function copySection(sectionId, btnEl) {
 }
 
 function newSession() {
+  if (!viewMode) saveCurrentSession();
+  exitViewMode();
   transcript = '';
   soapData = null;
   timerSeconds = 0;
@@ -961,9 +1094,167 @@ function newSession() {
   document.getElementById('cptRow').classList.remove('visible');
   document.getElementById('safetyWarning').classList.remove('visible');
   document.getElementById('generateBtn').classList.remove('ready');
+  document.getElementById('recordBtn').disabled = false;
   document.getElementById('recordLabel').textContent = 'Tap to begin session';
   document.getElementById('statusDot').className = 'status-dot';
   hideError();
+}
+
+function formatDuration(s) {
+  if (!s) return '';
+  const m = Math.floor(s / 60);
+  const sec = s % 60;
+  return m > 0 ? `${m}m ${String(sec).padStart(2,'0')}s` : `${sec}s`;
+}
+
+function renderSidebar() {
+  const list = document.getElementById('sessionList');
+  if (!sessions.length) {
+    list.innerHTML = '<div class="session-empty">Sessions appear here after you click New Session</div>';
+    return;
+  }
+  list.innerHTML = sessions.map(s => {
+    const d = new Date(s.date);
+    const dateStr = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+    const timeStr = d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+    const preview = s.transcript ? s.transcript.slice(0, 50).trim() + (s.transcript.length > 50 ? '…' : '') : 'No transcript';
+    const dur = formatDuration(s.duration);
+    return `<div class="session-item" data-id="${s.id}" onclick="viewSession(${s.id})">
+      <div class="session-item-meta">
+        <span class="session-item-date">${dateStr} · ${timeStr}</span>
+        ${dur ? `<span class="session-item-dur">${dur}</span>` : ''}
+      </div>
+      <div class="session-item-preview">${preview}</div>
+    </div>`;
+  }).join('');
+}
+
+function saveCurrentSession() {
+  const hasContent = transcript.trim().length > 0 || document.getElementById('soapS').textContent.trim().length > 0;
+  if (!hasContent) return;
+  const session = {
+    id: Date.now(),
+    date: new Date().toISOString(),
+    duration: timerSeconds,
+    transcript: transcript,
+    soap: {
+      S: document.getElementById('soapS').textContent,
+      O: document.getElementById('soapO').textContent,
+      A: document.getElementById('soapA').textContent,
+      P: document.getElementById('soapP').textContent,
+    }
+  };
+  sessions.unshift(session);
+  if (sessions.length > 50) sessions = sessions.slice(0, 50);
+  localStorage.setItem('scribe_sessions', JSON.stringify(sessions));
+  renderSidebar();
+}
+
+function viewSession(id) {
+  const session = sessions.find(s => s.id === id);
+  if (!session) return;
+
+  if (!viewMode) {
+    viewSnapshot = {
+      transcript,
+      soapS: document.getElementById('soapS').textContent,
+      soapO: document.getElementById('soapO').textContent,
+      soapA: document.getElementById('soapA').textContent,
+      soapP: document.getElementById('soapP').textContent,
+      transcriptVisible: document.getElementById('transcriptSection').classList.contains('visible'),
+      soapVisible: document.getElementById('soapSection').classList.contains('visible'),
+      cptVisible: document.getElementById('cptRow').classList.contains('visible'),
+      cptHTML: document.getElementById('cptChips').innerHTML,
+      generateReady: document.getElementById('generateBtn').classList.contains('ready'),
+      generateDisabled: document.getElementById('generateBtn').disabled,
+      recordDisabled: document.getElementById('recordBtn').disabled,
+      recordLabel: document.getElementById('recordLabel').textContent,
+    };
+  }
+
+  viewMode = true;
+  if (isRecording) stopRecording();
+
+  document.querySelectorAll('.session-item').forEach(el => el.classList.remove('active'));
+  document.querySelector(`.session-item[data-id="${id}"]`)?.classList.add('active');
+
+  const d = new Date(session.date);
+  document.getElementById('viewingBannerDate').textContent =
+    d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) + ' · ' +
+    d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+  document.getElementById('viewingBanner').classList.remove('hidden');
+  document.getElementById('recordSection').classList.add('hidden');
+
+  document.getElementById('transcriptPlaceholder').style.display = 'none';
+  document.getElementById('transcriptText').textContent = session.transcript || '';
+  document.getElementById('transcriptCursor').classList.add('hidden');
+  document.getElementById('transcriptSection').classList.add('visible');
+  document.getElementById('generateBtn').classList.add('hidden');
+  document.getElementById('safetyWarning').classList.remove('visible');
+  hideError();
+
+  if (session.soap) {
+    document.getElementById('soapS').textContent = session.soap.S || '—';
+    document.getElementById('soapO').textContent = session.soap.O || '—';
+    document.getElementById('soapA').textContent = session.soap.A || '—';
+    document.getElementById('soapP').textContent = session.soap.P || '—';
+    ['soapS','soapO','soapA','soapP'].forEach(id => document.getElementById(id).removeAttribute('contenteditable'));
+    document.getElementById('soapSection').classList.add('visible');
+  } else {
+    document.getElementById('soapSection').classList.remove('visible');
+  }
+
+  document.querySelector('.new-session-btn').classList.add('hidden');
+  document.getElementById('cptRow').classList.remove('visible');
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+function exitViewMode() {
+  if (!viewMode) return;
+  viewMode = false;
+
+  document.getElementById('viewingBanner').classList.add('hidden');
+  document.querySelectorAll('.session-item').forEach(el => el.classList.remove('active'));
+  ['soapS','soapO','soapA','soapP'].forEach(id => document.getElementById(id).setAttribute('contenteditable','true'));
+  document.getElementById('recordSection').classList.remove('hidden');
+  document.getElementById('generateBtn').classList.remove('hidden');
+  document.querySelector('.new-session-btn').classList.remove('hidden');
+
+  if (viewSnapshot) {
+    const snap = viewSnapshot;
+    viewSnapshot = null;
+    transcript = snap.transcript;
+    document.getElementById('transcriptText').textContent = snap.transcript || '';
+    document.getElementById('transcriptPlaceholder').style.display = snap.transcript ? 'none' : '';
+
+    snap.transcriptVisible
+      ? document.getElementById('transcriptSection').classList.add('visible')
+      : document.getElementById('transcriptSection').classList.remove('visible');
+
+    if (snap.soapVisible) {
+      document.getElementById('soapS').textContent = snap.soapS;
+      document.getElementById('soapO').textContent = snap.soapO;
+      document.getElementById('soapA').textContent = snap.soapA;
+      document.getElementById('soapP').textContent = snap.soapP;
+      document.getElementById('soapSection').classList.add('visible');
+    } else {
+      document.getElementById('soapSection').classList.remove('visible');
+    }
+
+    if (snap.cptVisible) {
+      document.getElementById('cptChips').innerHTML = snap.cptHTML;
+      document.getElementById('cptRow').classList.add('visible');
+    } else {
+      document.getElementById('cptRow').classList.remove('visible');
+    }
+
+    snap.generateReady
+      ? document.getElementById('generateBtn').classList.add('ready')
+      : document.getElementById('generateBtn').classList.remove('ready');
+    document.getElementById('generateBtn').disabled = snap.generateDisabled;
+    document.getElementById('recordBtn').disabled = snap.recordDisabled;
+    document.getElementById('recordLabel').textContent = snap.recordLabel;
+  }
 }
 
 function showError(msg) {
