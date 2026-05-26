@@ -6,7 +6,7 @@ AI-powered medical scribe web app. Single HTML file hosted on GitHub Pages. Reco
 
 ```
 wcp-scribe/
-├── index.html      # Entire app — UI, recording logic, API call
+├── index.html      # Entire app — UI, recording logic, API call (renamed from scribe.html)
 ├── CLAUDE.md       # This file
 └── README.md       # Optional
 ```
