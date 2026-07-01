@@ -1,0 +1,9 @@
+{
+  "name": "wcp-scribe",
+  "version": "1.0.0",
+  "private": true,
+  "description": "West County Physicians AI scribe — static site. This package.json exists only to run the dev tests; the app itself has no build step and no dependencies.",
+  "scripts": {
+    "test": "node --test"
+  }
+}

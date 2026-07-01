@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WCP Scribe — Browser Test Harness</title>
+  <style>
+    body { font-family: -apple-system, system-ui, sans-serif; background: #0d1f35; color: #f5f0e8;
+           margin: 0; padding: 2rem; line-height: 1.5; }
+    h1 { font-size: 1.4rem; margin: 0 0 0.25rem; }
+    h2 { font-size: 1rem; color: #2ec4a3; margin: 2rem 0 0.75rem; text-transform: uppercase; letter-spacing: 0.1em; }
+    .sub { color: rgba(245,240,232,0.55); font-size: 0.85rem; margin-bottom: 1rem; }
+    #summary { font-size: 1.1rem; font-weight: 600; padding: 0.6rem 1rem; border-radius: 8px; display: inline-block; }
+    .pass { background: rgba(46,196,163,0.15); color: #2ec4a3; }
+    .fail { background: rgba(224,92,92,0.15); color: #e05c5c; }
+    ul.results { list-style: none; padding: 0; margin: 0.5rem 0; font-family: 'SF Mono', ui-monospace, monospace; font-size: 0.82rem; }
+    ul.results li { padding: 2px 0; }
+    .ok::before  { content: "✔ "; color: #2ec4a3; }
+    .bad::before { content: "✖ "; color: #e05c5c; }
+    .bad { color: #f0a0a0; }
+    .err { color: #e05c5c; margin-left: 1.5rem; font-size: 0.78rem; }
+    .card { background: rgba(255,255,255,0.04); border: 0.5px solid rgba(255,255,255,0.1);
+            border-radius: 10px; padding: 1rem 1.25rem; margin-bottom: 1rem; }
+    button { background: #2ec4a3; color: #0d1f35; border: none; border-radius: 6px; padding: 0.5rem 1rem;
+             font-weight: 600; cursor: pointer; font-size: 0.85rem; }
+    pre { background: rgba(0,0,0,0.25); padding: 0.75rem 1rem; border-radius: 8px; overflow-x: auto;
+          font-size: 0.8rem; white-space: pre-wrap; }
+    code { color: #ffd080; }
+  </style>
+</head>
+<body>
+  <h1>WCP Scribe — Browser Test Harness</h1>
+  <div class="sub">
+    Open this file in <strong>Safari</strong> (and Chrome) to confirm the exact same logic the
+    Node tests cover also behaves in the real browser. This runs the shared spec
+    (<code>tests/spec.js</code>) against <code>helpers.js</code> — no build, no server, no mic needed.
+  </div>
+
+  <div id="summary">Running…</div>
+
+  <h2>Unit spec</h2>
+  <ul class="results" id="results"></ul>
+
+  <h2>Safari stream simulation</h2>
+  <div class="sub">
+    Feeds a fake recognition stream that mimics Safari's quirks — <em>duplicated</em> final
+    results plus a mid-session <em>restart</em> — through the real <code>buildTranscript</code>
+    used by the app, to prove the transcript comes out clean (no doubled text, nothing lost).
+  </div>
+  <div class="card">
+    <button onclick="runSim()">Run simulation</button>
+    <pre id="simOut">Press “Run simulation”.</pre>
+  </div>
+
+  <!-- load order matters: helpers define the globals the spec uses -->
+  <script src="../helpers.js"></script>
+  <script src="spec.js"></script>
+  <script>
+    // ── Run the shared unit spec ────────────────────────────────────────────────
+    (function () {
+      const cases = window.SCRIBE_SPEC || [];
+      const list = document.getElementById('results');
+      let passed = 0, failed = 0;
+      for (const c of cases) {
+        const li = document.createElement('li');
+        try {
+          c.fn();
+          li.className = 'ok';
+          li.textContent = c.name;
+          passed++;
+        } catch (e) {
+          li.className = 'bad';
+          li.textContent = c.name;
+          const err = document.createElement('div');
+          err.className = 'err';
+          err.textContent = (e && e.message) || String(e);
+          li.appendChild(err);
+          failed++;
+        }
+        list.appendChild(li);
+      }
+      const summary = document.getElementById('summary');
+      summary.textContent = failed === 0
+        ? `All ${passed} tests passed in this browser`
+        : `${failed} failed, ${passed} passed`;
+      summary.className = failed === 0 ? 'pass' : 'fail';
+    })();
+
+    // ── FakeSpeechRecognition: a scripted, mic-free stand-in ────────────────────
+    // Mirrors the app's onresult/onend assembly (sessionBase + buildTranscript)
+    // so we exercise the true assembly path against a Safari-shaped event stream.
+    function runSim() {
+      // A growing results list, as the Web Speech API delivers it, but with
+      // Safari's duplicate-final and a restart (list resets, base carries over).
+      const streamSession1 = [
+        [{ transcript: 'patient reports low mood', isFinal: true }],
+        [{ transcript: 'patient reports low mood', isFinal: true },
+         { transcript: 'and poor sleep', isFinal: true }],
+        // Safari re-emits the same final again — must not double up:
+        [{ transcript: 'patient reports low mood', isFinal: true },
+         { transcript: 'and poor sleep', isFinal: true },
+         { transcript: 'and poor sleep', isFinal: true }],
+        [{ transcript: 'patient reports low mood', isFinal: true },
+         { transcript: 'and poor sleep', isFinal: true },
+         { transcript: 'and poor sleep', isFinal: true },
+         { transcript: 'over the past', isFinal: false }], // live interim
+      ];
+
+      let base = '';
+      let lastFinal = '';
+      let transcript = '';
+
+      // Session 1
+      for (const results of streamSession1) {
+        const out = buildTranscript(base, results);
+        transcript = out.text;
+        lastFinal = out.final;
+      }
+      // …onend fires → restart: finalized text becomes the new base
+      base = lastFinal;
+
+      // Session 2 (fresh results list, as after a Safari restart)
+      const streamSession2 = [
+        [{ transcript: 'two weeks', isFinal: true }],
+        [{ transcript: 'two weeks', isFinal: true },
+         { transcript: 'denies SI', isFinal: true }],
+      ];
+      for (const results of streamSession2) {
+        const out = buildTranscript(base, results);
+        transcript = out.text;
+      }
+
+      const expected = 'patient reports low mood and poor sleep two weeks denies SI';
+      const actual = transcript.trim();
+      const doubled = /and poor sleep\s+and poor sleep/.test(actual);
+      const ok = actual === expected && !doubled;
+
+      document.getElementById('simOut').textContent =
+        'Assembled transcript:\n  "' + actual + '"\n\n' +
+        'Expected:\n  "' + expected + '"\n\n' +
+        'Doubled text present? ' + (doubled ? 'YES (bug!)' : 'no') + '\n' +
+        'SI/HI documented?     ' + (hasSafetyDoc(actual) ? 'yes' : 'no') + '\n\n' +
+        'RESULT: ' + (ok ? '✅ clean — dedupe + restart-carry both work'
+                         : '❌ mismatch — check buildTranscript');
+    }
+  </script>
+</body>
+</html>
