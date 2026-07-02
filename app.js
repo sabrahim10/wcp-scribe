@@ -29,6 +29,10 @@ let sessions    = JSON.parse(localStorage.getItem('scribe_sessions') || '[]');
 let viewMode    = false;
 let viewSnapshot = null;
 let pendingDraft = null;       // recovered draft awaiting restore/discard
+let currentSessionId = null;   // history id for the in-progress session
+let sessionStartISO  = null;   // when recording began — sessions are dated by this
+let lastPersistedTranscript = null;  // transcript text already safe in history
+let viewingSessionId = null;   // id of the history session open in view mode
 
 const DRAFT_KEY      = 'scribe_draft';
 const DIAG_KEY       = 'scribe_diag';
@@ -85,6 +89,11 @@ renderSidebar();
 // Auto-save safety net: persist the transcript if the tab is hidden or closed.
 window.addEventListener('beforeunload', saveDraft);
 window.addEventListener('pagehide', saveDraft);
+
+// Hand-edits to the SOAP fields are saved as soon as the field loses focus —
+// closing the tab without clicking New Session no longer drops them.
+['soapS', 'soapO', 'soapA', 'soapP'].forEach(id =>
+  document.getElementById(id).addEventListener('blur', () => { if (!viewMode) persistSession(); }));
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) {
     // A hidden tab has its microphone suspended by the OS — save in case, and the
@@ -126,7 +135,10 @@ function startRecording() {
     return;
   }
 
-  // Reset per-recording state, then build and start the recognizer.
+  // Reset per-recording state, then build and start the recognizer. The previous
+  // transcript (if any) is already in history — persisted when it was stopped —
+  // so dropping it here can no longer lose anything.
+  transcript       = '';
   sessionBase      = '';
   hasResult        = false;
   recogRunning     = false;
@@ -139,8 +151,15 @@ function startRecording() {
   lastResultTime   = Date.now();
   isRecording      = true;
 
+  // Each recording is its own history entry, dated by when it was recorded
+  // (not by when it later gets saved or a note generated).
+  currentSessionId = Date.now();
+  sessionStartISO  = new Date().toISOString();
+  lastPersistedTranscript = null;
+
   diag('record_start');
-  hideRestore();          // starting fresh — dismiss any leftover recovery banner
+  bankPendingDraft();     // starting fresh — an unrestored crash draft goes to
+  hideRestore();          // history instead of being overwritten by this recording
   hideError();
   recognition = makeRecognition();
   tryStartRecognition();
@@ -338,6 +357,9 @@ function stopRecording() {
   clearInterval(watchdogInterval);
   saveDraft();
   diag('record_stop', 'dur:' + timerSeconds + 's restarts:' + restartCount);
+  // Commit the transcript to permanent history right now — not at New Session.
+  // A generate error, crash, or closed tab after this point can't lose it.
+  persistSession();
 
   document.getElementById('recordBtn').classList.remove('recording');
   document.getElementById('micIcon').style.display = 'block';
@@ -383,6 +405,7 @@ function scheduleTranscriptRender() {
 
 function saveDraft() {
   if (!transcript.trim()) return;
+  if (transcript === lastPersistedTranscript) return; // already safe in history
   try {
     localStorage.setItem(DRAFT_KEY, serializeDraft(transcript, timerSeconds, new Date().toISOString()));
     diag('draft_saved', 'len:' + transcript.length);
@@ -413,7 +436,13 @@ function restoreDraft() {
   if (!pendingDraft) return;
   transcript   = pendingDraft.transcript || '';
   timerSeconds = pendingDraft.duration || 0;
+  // Give the recovered transcript its own history entry, dated by when the
+  // draft was last captured, and commit it immediately.
+  currentSessionId = Date.now();
+  sessionStartISO  = pendingDraft.savedAt || new Date().toISOString();
+  lastPersistedTranscript = null;
   pendingDraft = null;
+  persistSession();
 
   const m = String(Math.floor(timerSeconds / 60)).padStart(2, '0');
   const s = String(timerSeconds % 60).padStart(2, '0');
@@ -427,6 +456,33 @@ function restoreDraft() {
   checkSafetyDoc();
   diag('draft_restored');
   hideRestore();
+}
+
+// Called when a new recording starts while an unrestored crash draft is still
+// pending: commit it to history as its own session (dated by when it was
+// captured) so the new recording can't overwrite the only copy. Explicitly
+// clicking Discard still discards.
+function bankPendingDraft() {
+  if (!pendingDraft || !isDraftRestorable(pendingDraft)) { pendingDraft = null; return; }
+  let id = Date.now();
+  while (id === currentSessionId || sessions.some(s => s.id === id)) id++;
+  const session = {
+    id:         id,
+    date:       pendingDraft.savedAt || new Date().toISOString(),
+    duration:   pendingDraft.duration || 0,
+    transcript: pendingDraft.transcript,
+    soap:       null,
+  };
+  try {
+    sessions = upsertSession(sessions, session, 100);
+    localStorage.setItem('scribe_sessions', JSON.stringify(sessions));
+    clearDraft();
+    renderSidebar();
+    diag('draft_banked', 'len:' + session.transcript.length);
+  } catch (e) {
+    diag('persist_error', (e && e.name) || 'error');  // keep the draft copy
+  }
+  pendingDraft = null;
 }
 
 function discardDraft() {
@@ -469,14 +525,18 @@ TRANSCRIPT:
 Respond with only the JSON object, no markdown, no explanation.`;
 
 async function generateSOAP() {
-  if (!transcript.trim()) return;
+  // In view mode the button only shows for a saved session that has no note yet
+  // (e.g. generation failed on the day) — generate from its stored transcript.
+  const viewing = viewMode ? sessions.find(s => s.id === viewingSessionId) : null;
+  const sourceText = viewing ? (viewing.transcript || '') : transcript;
+  if (!sourceText.trim()) return;
   if (isRecording) stopRecording();
 
   const btn = document.getElementById('generateBtn');
   btn.disabled = true;
   btn.innerHTML = '<span class="spinner"></span> Generating...';
   hideError();
-  diag('generate_start', 'transcriptLen:' + transcript.length);
+  diag('generate_start', 'transcriptLen:' + sourceText.length);
 
   try {
     const response = await fetch('https://api.anthropic.com/v1/messages', {
@@ -490,7 +550,7 @@ async function generateSOAP() {
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
         max_tokens: 4000,
-        messages: [{ role: 'user', content: SOAP_PROMPT.replace('{{transcript}}', transcript) }]
+        messages: [{ role: 'user', content: SOAP_PROMPT.replace('{{transcript}}', sourceText) }]
       })
     });
 
@@ -506,19 +566,32 @@ async function generateSOAP() {
     document.getElementById('soapO').textContent = parsed.O || '—';
     document.getElementById('soapA').textContent = parsed.A || '—';
     document.getElementById('soapP').textContent = parsed.P || '—';
-    soapData = parsed;
 
-    showCPT();
+    if (viewing) {
+      // Attach the note to the saved session it was generated from.
+      viewing.soap = readSoapFromDOM();
+      try { localStorage.setItem('scribe_sessions', JSON.stringify(sessions)); } catch (e) {}
+      ['soapS', 'soapO', 'soapA', 'soapP'].forEach(id => document.getElementById(id).removeAttribute('contenteditable'));
+      renderSidebar();
+      document.querySelector(`.session-item[data-id="${viewing.id}"]`)?.classList.add('active');
+      document.getElementById('generateBtn').classList.add('hidden');
+    } else {
+      soapData = parsed;
+      persistSession();  // the note is now saved with its session — no click needed
+      document.getElementById('statusDot').className = 'status-dot done';
+      document.getElementById('recordBtn').disabled = true;
+      document.getElementById('recordLabel').textContent = 'Note generated and saved — click New Session to continue';
+    }
+
+    showCPT(viewing ? viewing.duration : timerSeconds);
     document.getElementById('soapSection').classList.add('visible');
     document.getElementById('soapSection').scrollIntoView({ behavior: 'smooth', block: 'start' });
-    document.getElementById('statusDot').className = 'status-dot done';
-    document.getElementById('recordBtn').disabled = true;
-    document.getElementById('recordLabel').textContent = 'Note generated — click New Session to continue';
     diag('generate_ok');
 
   } catch (err) {
     diag('generate_error', err.message);
-    showError('Error generating note: ' + err.message);
+    showError('Error generating note: ' + err.message +
+      ' — the transcript is already saved in the session list, so you can retry now or later.');
   } finally {
     btn.disabled = false;
     btn.innerHTML = 'Generate SOAP Note';
@@ -535,8 +608,8 @@ function checkSafetyDoc() {
   else el.classList.remove('visible');
 }
 
-function showCPT() {
-  const pairs = selectCPT(timerSeconds);
+function showCPT(seconds) {
+  const pairs = selectCPT(seconds);
   if (!pairs.length) return;
 
   const chips = pairs.map(([code, label], i) =>
@@ -600,7 +673,7 @@ function formatDuration(s) {
 function renderSidebar() {
   const list = document.getElementById('sessionList');
   if (!sessions.length) {
-    list.innerHTML = '<div class="session-empty">Sessions appear here after you click New Session</div>';
+    list.innerHTML = '<div class="session-empty">Sessions save here automatically when you stop recording</div>';
     return;
   }
   list.innerHTML = sessions.map(s => {
@@ -610,37 +683,66 @@ function renderSidebar() {
     const preview = s.transcript
       ? s.transcript.slice(0, 50).trim() + (s.transcript.length > 50 ? '…' : '')
       : 'No transcript';
-    const dur = formatDuration(s.duration);
+    const dur  = formatDuration(s.duration);
+    const flag = sessionHasNote(s) ? '' : '<span class="session-item-flag">No note yet</span>';
     return `<div class="session-item" data-id="${s.id}" onclick="viewSession(${s.id})">
       <div class="session-item-meta">
         <span class="session-item-date">${dateStr} · ${timeStr}</span>
-        ${dur ? `<span class="session-item-dur">${dur}</span>` : ''}
+        <span>${flag}${dur ? `<span class="session-item-dur">${dur}</span>` : ''}</span>
       </div>
       <div class="session-item-preview">${preview}</div>
     </div>`;
   }).join('');
 }
 
-function saveCurrentSession() {
-  const hasSoap = document.getElementById('soapS').textContent.trim().length > 0;
-  if (!transcript.trim() && !hasSoap) return;
+// The SOAP note as currently shown/edited on screen, or null if there isn't one.
+function readSoapFromDOM() {
+  const S = document.getElementById('soapS').textContent;
+  const O = document.getElementById('soapO').textContent;
+  const A = document.getElementById('soapA').textContent;
+  const P = document.getElementById('soapP').textContent;
+  return [S, O, A, P].some(t => t.trim() && t.trim() !== '—') ? { S, O, A, P } : null;
+}
+
+// Upsert the in-progress session into permanent history. Runs at stop, after
+// note generation, on draft restore, and at New Session (captures SOAP edits) —
+// so a generate error, crash, or closed tab can no longer lose a transcript.
+// Returns true once the transcript is safely in history (the draft then goes).
+function persistSession() {
+  const soap = readSoapFromDOM();
+  if (!transcript.trim() && !soap) return false;
+  if (!currentSessionId) currentSessionId = Date.now();
+  if (!sessionStartISO)  sessionStartISO  = new Date().toISOString();
   const session = {
-    id:         Date.now(),
-    date:       new Date().toISOString(),
+    id:         currentSessionId,
+    date:       sessionStartISO,
     duration:   timerSeconds,
     transcript: transcript,
-    soap: {
-      S: document.getElementById('soapS').textContent,
-      O: document.getElementById('soapO').textContent,
-      A: document.getElementById('soapA').textContent,
-      P: document.getElementById('soapP').textContent,
-    }
+    soap:       soap,
   };
-  sessions.unshift(session);
-  if (sessions.length > 100) sessions = sessions.slice(0, 100);
-  localStorage.setItem('scribe_sessions', JSON.stringify(sessions));
+  try {
+    sessions = upsertSession(sessions, session, 100);
+    localStorage.setItem('scribe_sessions', JSON.stringify(sessions));
+  } catch (e) {
+    // Write failed (e.g. storage full) — keep the draft copy as the fallback.
+    diag('persist_error', (e && e.name) || 'error');
+    return false;
+  }
+  lastPersistedTranscript = transcript;
   clearDraft();  // transcript is safely in history now — drop the recovery copy
   renderSidebar();
+  diag('session_persisted', 'len:' + transcript.length + (soap ? ' soap:yes' : ' soap:no'));
+  return true;
+}
+
+// Whether a saved session has an actual note (older entries may carry an
+// all-empty soap object from before notes were saved with their session).
+function sessionHasNote(s) {
+  const soap = s && s.soap;
+  return !!soap && ['S', 'O', 'A', 'P'].some(k => {
+    const t = (soap[k] || '').trim();
+    return t && t !== '—';
+  });
 }
 
 function viewSession(id) {
@@ -665,6 +767,7 @@ function viewSession(id) {
     };
   }
 
+  viewingSessionId = id;
   viewMode = true;
   if (isRecording) stopRecording();
 
@@ -682,21 +785,26 @@ function viewSession(id) {
   document.getElementById('transcriptText').textContent = session.transcript || '';
   document.getElementById('transcriptCursor').classList.add('hidden');
   document.getElementById('transcriptSection').classList.add('visible');
-  document.getElementById('generateBtn').classList.add('hidden');
   document.getElementById('safetyWarning').classList.remove('visible');
   document.querySelector('.new-session-btn').classList.add('hidden');
   document.getElementById('cptRow').classList.remove('visible');
   hideError();
 
-  if (session.soap) {
+  if (sessionHasNote(session)) {
     document.getElementById('soapS').textContent = session.soap.S || '—';
     document.getElementById('soapO').textContent = session.soap.O || '—';
     document.getElementById('soapA').textContent = session.soap.A || '—';
     document.getElementById('soapP').textContent = session.soap.P || '—';
     ['soapS', 'soapO', 'soapA', 'soapP'].forEach(id => document.getElementById(id).removeAttribute('contenteditable'));
     document.getElementById('soapSection').classList.add('visible');
+    document.getElementById('generateBtn').classList.add('hidden');
   } else {
+    // Saved transcript without a note (e.g. generation failed that day) —
+    // offer to generate it right here, from the stored transcript.
     document.getElementById('soapSection').classList.remove('visible');
+    const gen = document.getElementById('generateBtn');
+    gen.classList.remove('hidden');
+    gen.classList.add('ready');
   }
 
   window.scrollTo({ top: 0, behavior: 'smooth' });
@@ -705,6 +813,7 @@ function viewSession(id) {
 function exitViewMode() {
   if (!viewMode) return;
   viewMode = false;
+  viewingSessionId = null;
 
   document.getElementById('viewingBanner').classList.add('hidden');
   document.querySelectorAll('.session-item').forEach(el => el.classList.remove('active'));
@@ -725,15 +834,16 @@ function exitViewMode() {
     ? document.getElementById('transcriptSection').classList.add('visible')
     : document.getElementById('transcriptSection').classList.remove('visible');
 
-  if (snap.soapVisible) {
-    document.getElementById('soapS').textContent = snap.soapS;
-    document.getElementById('soapO').textContent = snap.soapO;
-    document.getElementById('soapA').textContent = snap.soapA;
-    document.getElementById('soapP').textContent = snap.soapP;
-    document.getElementById('soapSection').classList.add('visible');
-  } else {
-    document.getElementById('soapSection').classList.remove('visible');
-  }
+  // Always restore the field contents (not just visibility) so the viewed
+  // session's note can never linger in the hidden fields and get persisted
+  // as if it belonged to the live session.
+  document.getElementById('soapS').textContent = snap.soapS;
+  document.getElementById('soapO').textContent = snap.soapO;
+  document.getElementById('soapA').textContent = snap.soapA;
+  document.getElementById('soapP').textContent = snap.soapP;
+  snap.soapVisible
+    ? document.getElementById('soapSection').classList.add('visible')
+    : document.getElementById('soapSection').classList.remove('visible');
 
   if (snap.cptVisible) {
     document.getElementById('cptChips').innerHTML = snap.cptHTML;
@@ -753,12 +863,18 @@ function exitViewMode() {
 // ── Session reset ─────────────────────────────────────────────────────────────
 
 function newSession() {
-  if (!viewMode) saveCurrentSession();
+  // The session is already in history (persisted at stop / after generation).
+  // Restore the live state if we were viewing an old session, persist once more
+  // to capture any hand-edits to the SOAP fields, then reset the screen.
   exitViewMode();
+  persistSession();
 
   transcript = '';
   soapData   = null;
   timerSeconds = 0;
+  currentSessionId = null;
+  sessionStartISO  = null;
+  lastPersistedTranscript = null;
 
   document.getElementById('timer').textContent = '00:00';
   document.getElementById('timer').classList.remove('visible');

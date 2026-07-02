@@ -112,6 +112,17 @@ body {
   font-family: 'DM Mono', monospace;
 }
 
+.session-item-flag {
+  font-size: 0.6rem;
+  color: #e0b25c;
+  border: 1px solid rgba(224,178,92,0.4);
+  border-radius: 3px;
+  padding: 1px 4px;
+  margin-right: 6px;
+  font-family: 'DM Mono', monospace;
+  white-space: nowrap;
+}
+
 .session-item-preview {
   font-size: 0.7rem;
   color: var(--muted);

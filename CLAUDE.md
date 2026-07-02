@@ -114,6 +114,35 @@ final results). See `tests/SAFARI_CHECKLIST.md`.
 - [x] **Manual Safari QA checklist** — `tests/SAFARI_CHECKLIST.md` covers system
   settings, fan/heat, 60-min endurance, crash/restore, and diagnostics.
 
+## Tier 1c — Sessions persist automatically (done — July 2026)
+
+Field incident (June 23, 2026): note generation errored after a session; the
+transcript only lived in the single `scribe_draft` slot, which a later recording
+overwrote — the transcript was permanently lost, because history was only written
+when "New Session" was clicked. The save lifecycle is now:
+
+- [x] **Persist on stop, not on New Session** — `persistSession()` upserts the
+  session into `scribe_sessions` (via `upsertSession` in `helpers.js`, capped at
+  100) the moment recording stops, again after a successful note generation, on
+  draft restore, and at New Session (to capture hand-edits to the SOAP fields).
+  "New Session" is now just a screen reset — nothing is lost by skipping it.
+- [x] **Sessions dated by recording start** (`sessionStartISO`), not by when they
+  were saved — entries land under the day the patient was actually seen.
+- [x] **Draft slot demoted to mid-recording crash protection only** — it is
+  cleared once the transcript is in history, and `saveDraft` skips writing when
+  the transcript is already persisted (no stale restore banners / duplicates).
+  A restored draft is committed to history immediately, and starting a new
+  recording while a crash draft is pending banks it to history
+  (`bankPendingDraft`) instead of overwriting it. Only an explicit "Discard"
+  deletes a draft.
+- [x] **Generate a note later from history** — sessions without a note show a
+  "No note yet" flag in the sidebar; opening one shows the Generate button, which
+  generates from the stored transcript and attaches the note to that session.
+- [x] **Reassuring generate-error message** — the error banner now says the
+  transcript is already saved and can be retried now or later.
+- [x] **Fixed silent discard** — clicking "New Session" while viewing a past
+  session used to skip saving and wipe the unsaved live transcript.
+
 ## Recognition lifecycle & reconnect behavior (how it actually runs)
 
 Field testing on Safari established these behaviors — read this before touching the
@@ -180,13 +209,19 @@ Dev-only, zero-dependency. Test cases live in `tests/spec.js` and run in two pla
 
 ```
 cd wcp-scribe
-npm test                     # Node runner (node --test) — 27 cases
-open tests/harness.html      # Same cases in a real browser — run this in SAFARI
+npm test                     # Node runner (node --test) — 32 cases
+python3 -m http.server 8000  # then open http://localhost:8000/tests/harness.html in SAFARI
 ```
+
+The harness must be served over HTTP for Safari — opened via file:// Safari blocks
+the `../helpers.js` load (parent-directory access) and every helper comes up
+undefined; Chrome tolerates it, which can mask the problem. The harness now shows
+an explanatory banner instead of 31 bogus failures when this happens.
 
 Coverage: transcript assembly + Safari duplicate-final dedupe (`buildTranscript`),
 CPT selection, SI/HI detection, SOAP JSON parsing (fences/prose/truncation repair),
-draft serialization/recovery, and error-code → message mapping.
+draft serialization/recovery, session history upsert (`upsertSession`), and
+error-code → message mapping.
 
 For anything involving the mic, Apple's speech servers, or the fan, run
 `tests/SAFARI_CHECKLIST.md` on the actual MacBook — automated tests can't cover those.
