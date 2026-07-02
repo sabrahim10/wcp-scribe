@@ -31,9 +31,11 @@
 <body>
   <h1>WCP Scribe — Browser Test Harness</h1>
   <div class="sub">
-    Open this file in <strong>Safari</strong> (and Chrome) to confirm the exact same logic the
-    Node tests cover also behaves in the real browser. This runs the shared spec
-    (<code>tests/spec.js</code>) against <code>helpers.js</code> — no build, no server, no mic needed.
+    Open this page in <strong>Safari</strong> (and Chrome) to confirm the exact same logic the
+    Node tests cover also behaves in the real browser. It runs the shared spec
+    (<code>tests/spec.js</code>) against <code>helpers.js</code> — no build, no mic needed.
+    In Safari it must be served over HTTP (<code>python3 -m http.server</code>), not double-clicked —
+    Safari blocks <code>file://</code> pages from loading <code>../helpers.js</code>.
   </div>
 
   <div id="summary">Running…</div>
@@ -58,6 +60,23 @@
   <script>
     // ── Run the shared unit spec ────────────────────────────────────────────────
     (function () {
+      // Safari refuses to load ../helpers.js when this page is opened via
+      // file:// (parent-directory access is blocked). Explain instead of
+      // reporting every test as a cryptic "not a function" failure.
+      if (typeof window.buildTranscript !== 'function') {
+        const summary = document.getElementById('summary');
+        summary.className = 'fail';
+        summary.textContent = 'helpers.js did not load — tests not run';
+        const note = document.createElement('div');
+        note.className = 'sub';
+        note.style.marginTop = '1rem';
+        note.innerHTML = 'Safari blocks a <code>file://</code> page from loading ' +
+          '<code>../helpers.js</code>. Serve the project instead:<br><br>' +
+          '<code>cd wcp-scribe && python3 -m http.server 8000</code><br><br>' +
+          'then open <code>http://localhost:8000/tests/harness.html</code> in Safari.';
+        summary.insertAdjacentElement('afterend', note);
+        return;
+      }
       const cases = window.SCRIBE_SPEC || [];
       const list = document.getElementById('results');
       let passed = 0, failed = 0;

@@ -96,6 +96,20 @@ function isDraftRestorable(draft) {
   return !!draft && typeof draft.transcript === 'string' && draft.transcript.trim().length > 0;
 }
 
+// Session history upsert ---------------------------------------------------------
+//
+// Insert a session at the front of the list, or replace it in place if an entry
+// with the same id already exists (a session is persisted at stop, then again
+// when its note is generated / edited). Returns a new array capped at `cap`.
+function upsertSession(list, session, cap) {
+  const sessions = (list || []).slice();
+  const idx = sessions.findIndex(s => s.id === session.id);
+  if (idx !== -1) sessions[idx] = session;
+  else sessions.unshift(session);
+  const max = cap || 100;
+  return sessions.length > max ? sessions.slice(0, max) : sessions;
+}
+
 // Human-readable messages for known SpeechRecognition failures ------------------
 //
 // Safari's error codes are cryptic and several map to fixable system settings
@@ -154,6 +168,7 @@ if (typeof module !== 'undefined' && module.exports) {
     parseSOAPResponse,
     serializeDraft,
     isDraftRestorable,
+    upsertSession,
     friendlyRecognitionError,
     isTransientRecognitionError,
     formatDiagnostics,

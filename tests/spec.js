@@ -135,6 +135,39 @@
     eq(H.isDraftRestorable({}), false);
   });
 
+  // ── Session history upsert ───────────────────────────────────────────────────
+
+  test('upsertSession: inserts a new session at the front', () => {
+    const out = H.upsertSession([{ id: 1, transcript: 'old' }], { id: 2, transcript: 'new' });
+    eq(out.length, 2);
+    eq(out[0].id, 2);
+    eq(out[1].id, 1);
+  });
+  test('upsertSession: replaces an existing session in place (same id)', () => {
+    const list = [{ id: 2, transcript: 'no note' }, { id: 1, transcript: 'old' }];
+    const out = H.upsertSession(list, { id: 2, transcript: 'no note', soap: { S: 's' } });
+    eq(out.length, 2);
+    eq(out[0].id, 2);
+    ok(out[0].soap, 'soap should be attached to the existing entry');
+    eq(out[1].id, 1);
+  });
+  test('upsertSession: does not mutate the input list', () => {
+    const list = [{ id: 1 }];
+    H.upsertSession(list, { id: 2 });
+    eq(list.length, 1);
+  });
+  test('upsertSession: caps the list, dropping the oldest', () => {
+    const list = [];
+    for (let i = 5; i >= 1; i--) list.push({ id: i });
+    const out = H.upsertSession(list, { id: 6 }, 3);
+    deepEq(out.map(s => s.id), [6, 5, 4]);
+  });
+  test('upsertSession: null/empty list tolerated', () => {
+    const out = H.upsertSession(null, { id: 1 });
+    eq(out.length, 1);
+    eq(out[0].id, 1);
+  });
+
   // ── Error mapping / diagnostics ──────────────────────────────────────────────
 
   test('friendlyRecognitionError: maps known Safari codes to guidance', () => {
