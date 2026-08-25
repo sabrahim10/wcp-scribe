@@ -123,6 +123,7 @@ function hasKeys() { return !!apiKey && !!assemblyKey; }
 function showMain() {
   document.getElementById('setupCard').classList.add('hidden');
   document.getElementById('mainInterface').classList.remove('hidden');
+  document.getElementById('newSessionTop').classList.remove('hidden');
 }
 
 function prefillSetup() {
@@ -385,14 +386,17 @@ async function startRecording() {
   }, SILENCE_HINT_MS);
 }
 
-function stopRecording() {
+// `onFinished` runs once the recorder has flushed and the session is safely in
+// history — callers that want to reset the screen must wait for that, or they
+// would clear `currentSessionId` out from under the final chunk write.
+function stopRecording(onFinished) {
   if (!isRecording) return;
   isRecording = false;
   clearInterval(timerInterval);
   clearTimeout(silenceTimer);
   stopMeter();
 
-  const finish = () => { releaseStream(); finishRecording(); };
+  const finish = () => { releaseStream(); finishRecording(onFinished); };
   if (mediaRecorder && mediaRecorder.state !== 'inactive') {
     mediaRecorder.onstop = finish;
     try { mediaRecorder.stop(); } catch (e) { finish(); }
@@ -414,16 +418,18 @@ function stopRecording() {
 // Runs once MediaRecorder has flushed its final chunk: the recording is now
 // complete on disk. Persist the session first, then start transcription — in
 // that order, so a failure in the second step can never affect the first.
-function finishRecording() {
+function finishRecording(onFinished) {
   diag('record_stop', 'dur:' + timerSeconds + 's chunks:' + chunkSeq + ' errs:' + chunkErrors);
   if (!chunkSeq) {
     showError('No audio was captured for this session. Check the microphone input and try again.');
     setTranscriptPlaceholder('No audio was captured.');
+    if (onFinished) onFinished();
     return;
   }
   persistSession({ hasAudio: true, audioMime, transcriptionStatus: 'queued' });
   pruneAudio();
   transcribeSession(currentSessionId);
+  if (onFinished) onFinished();
 }
 
 function releaseStream() {
@@ -1171,7 +1177,17 @@ function hideRestore() {
 
 // ── Session reset ─────────────────────────────────────────────────────────────
 
+// Clears the screen for the next patient. Safe to click at any time: nothing is
+// discarded, because the session is already in history.
 function newSession() {
+  // Forgot to press stop? Finish the recording properly first — it lands in
+  // history and keeps transcribing in the background under its own entry — and
+  // only then clear the screen. Resetting first would orphan the final chunk.
+  if (isRecording) { stopRecording(resetSessionScreen); return; }
+  resetSessionScreen();
+}
+
+function resetSessionScreen() {
   exitViewMode();
   persistSession();
 

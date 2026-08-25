@@ -253,6 +253,25 @@ header {
   padding-bottom: 2px;
 }
 
+/* Primary header action — the button she reaches for between every patient. */
+.header-btn {
+  background: var(--teal);
+  border: none;
+  border-radius: 6px;
+  color: var(--navy);
+  padding: 0.35rem 0.9rem;
+  font-family: 'Outfit', sans-serif;
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.2s, transform 0.15s;
+}
+.header-btn:hover { background: #3dd6b5; transform: translateY(-1px); }
+.header-btn:active { transform: scale(0.98); }
+
 .settings-btn {
   background: transparent;
   border: 0.5px solid var(--card-border);
@@ -418,8 +437,11 @@ header {
   opacity: 0;
   transform: translateY(8px);
   transition: opacity 0.4s, transform 0.4s;
+  /* These sections fade rather than display:none, so without this their buttons
+     stay clickable while invisible — including the bottom "+ New Session". */
+  pointer-events: none;
 }
-.transcript-section.visible { opacity: 1; transform: translateY(0); }
+.transcript-section.visible { opacity: 1; transform: translateY(0); pointer-events: auto; }
 
 .section-label {
   font-size: 0.7rem;
@@ -582,8 +604,9 @@ header {
   opacity: 0;
   transform: translateY(8px);
   transition: opacity 0.5s, transform 0.5s;
+  pointer-events: none;   /* see .transcript-section */
 }
-.soap-section.visible { opacity: 1; transform: translateY(0); }
+.soap-section.visible { opacity: 1; transform: translateY(0); pointer-events: auto; }
 
 .soap-header {
   display: flex;
