@@ -1,47 +1,62 @@
 // The pure, DOM-free logic lives in helpers.js, which index.html loads before
-// this file (so hasSafetyDoc, selectCPT, buildTranscript, parseSOAPResponse,
-// friendlyRecognitionError, formatDiagnostics, etc. are available as globals).
+// this file (so hasSafetyDoc, selectCPT, pickAudioMime, buildUtteranceTranscript,
+// assemblyErrorMessage, parseSOAPResponse, formatDiagnostics, etc. are globals).
+//
+// Recording model (Tier 2): the microphone is captured with MediaRecorder and
+// written to IndexedDB in 5-second chunks *as it records*. Transcription happens
+// after the session ends, by uploading that audio to AssemblyAI. There is no
+// live speech recognition any more — which means there is no longer any way for
+// speech to be "missed": the audio is on disk before anything else is attempted,
+// so every downstream failure (no credits, no wifi, bad key, closed tab) delays a
+// note instead of losing one.
 
 // ── State ────────────────────────────────────────────────────────────────────
 
 let apiKey      = localStorage.getItem('scribe_key') || '';
-let recognition = null;
-let isRecording = false;       // user intends to be recording
+let assemblyKey = localStorage.getItem('scribe_assembly_key') || '';
+let isRecording = false;
 let transcript  = '';
 let timerInterval = null;
 let timerSeconds  = 0;
-let draftInterval = null;      // periodic auto-save while recording
-let watchdogInterval = null;   // keeps recognition alive across Safari restarts
-let lastResultTime = 0;        // timestamp of the last recognition result
-let renderPending  = false;    // throttle for transcript DOM writes
-let lastRenderTime = 0;
-let restartCount   = 0;        // recognition restarts this session (diagnostics)
-let sessionBase    = '';       // finalized text from prior recognition sessions
-let hasResult      = false;    // have we transcribed anything this recording?
-let recogRunning   = false;    // a recognition session is currently live
-let starting       = false;    // a start() is in flight (awaiting onstart)
-let reconnecting   = false;    // capture dropped; UI is showing "reconnecting"
-let restartDelay   = 300;      // current backoff between restart attempts (ms)
-let sessionHadSpeech = false;  // did the current recognition session capture speech?
-let restartScheduled = false;  // a restart timer is already pending
 let soapData    = null;
 let sessions    = JSON.parse(localStorage.getItem('scribe_sessions') || '[]');
 let viewMode    = false;
 let viewSnapshot = null;
-let pendingDraft = null;       // recovered draft awaiting restore/discard
+let pendingDraft = null;       // legacy Web Speech draft awaiting restore/discard
 let currentSessionId = null;   // history id for the in-progress session
 let sessionStartISO  = null;   // when recording began — sessions are dated by this
-let lastPersistedTranscript = null;  // transcript text already safe in history
 let viewingSessionId = null;   // id of the history session open in view mode
 
-const DRAFT_KEY      = 'scribe_draft';
-const DIAG_KEY       = 'scribe_diag';
-const DIAG_MAX       = 250;    // rolling diagnostic events kept
-const RENDER_MS      = 400;    // at most one transcript repaint per 400ms
-const RESTART_MIN_MS     = 300;   // fast restart mid-conversation (natural pauses)
-const RESTART_SILENCE_MS = 2500;  // slower restart during pure silence (fewer beeps)
-const RESTART_MAX_MS     = 5000;  // backoff cap when Safari keeps blocking restarts
-const ZOMBIE_MS          = 40000; // running-but-silent this long → recreate recognizer
+// Audio capture
+let mediaStream   = null;
+let mediaRecorder = null;
+let audioMime     = '';
+let chunkSeq      = 0;
+let chunkErrors   = 0;
+let audioCtx      = null;
+let analyserNode  = null;
+let meterRAF      = null;
+let sawSound      = false;
+let silenceTimer  = null;
+
+// Transcription. A run is deliberately never cancelled: once audio is submitted the
+// result is already paid for, so an in-flight job keeps going even if the user moves
+// on to a new session — it just writes to its own history entry instead of the screen.
+const inFlight = new Set();    // session ids currently being transcribed
+
+const DRAFT_KEY  = 'scribe_draft';
+const DIAG_KEY   = 'scribe_diag';
+const USAGE_KEY  = 'scribe_usage';
+const DIAG_MAX   = 250;        // rolling diagnostic events kept
+const CHUNK_MS   = 5000;       // audio flushed to IndexedDB every 5s
+const METER_MS   = 80;         // level meter repaint gate (~12fps)
+const AUDIO_BPS  = 64000;      // 64 kbps — ample for speech, ~21 MB per hour
+const POLL_MS    = 3000;       // AssemblyAI status poll interval
+const POLL_MAX_MS = 30 * 60 * 1000;
+const SILENCE_HINT_MS = 20000; // no sound at all this long → likely wrong input
+const AUDIO_KEEP_RECENT = 10;  // recordings kept regardless of note status
+
+const ASSEMBLY_BASE = 'https://api.assemblyai.com';
 
 // ── Diagnostics (metadata only — never transcript text / PHI) ──────────────────
 
@@ -59,7 +74,7 @@ function diagEnv() {
   return {
     generatedAt: new Date().toISOString(),
     userAgent: navigator.userAgent,
-    speechSupported: ('webkitSpeechRecognition' in window) || ('SpeechRecognition' in window),
+    audioMime: audioMime || pickAudioMime(mimeSupported) || 'browser default',
   };
 }
 
@@ -77,92 +92,262 @@ function copyDiagnostics() {
 // ── Init ─────────────────────────────────────────────────────────────────────
 
 try { diagLog = JSON.parse(localStorage.getItem(DIAG_KEY) || '[]'); } catch (e) { diagLog = []; }
-diag('app_load', diagEnv().speechSupported ? 'speech:yes' : 'speech:no');
+diag('app_load', 'mime:' + (pickAudioMime(mimeSupported) || 'default'));
 
-if (apiKey) {
-  document.getElementById('setupCard').classList.add('hidden');
-  document.getElementById('mainInterface').classList.remove('hidden');
+if (hasKeys()) {
+  showMain();
   maybeOfferRestore();
+  resumeUnfinishedWork();
+} else {
+  prefillSetup();
 }
 renderSidebar();
-
-// Auto-save safety net: persist the transcript if the tab is hidden or closed.
-window.addEventListener('beforeunload', saveDraft);
-window.addEventListener('pagehide', saveDraft);
+renderCredits();
 
 // Hand-edits to the SOAP fields are saved as soon as the field loses focus —
 // closing the tab without clicking New Session no longer drops them.
 ['soapS', 'soapO', 'soapA', 'soapP'].forEach(id =>
   document.getElementById(id).addEventListener('blur', () => { if (!viewMode) persistSession(); }));
-document.addEventListener('visibilitychange', () => {
-  if (document.hidden) {
-    // A hidden tab has its microphone suspended by the OS — save in case, and the
-    // recognizer will drop. Nothing we can do about capture while backgrounded.
-    saveDraft();
-  } else if (isRecording && !recogRunning && !starting) {
-    // Back in view (e.g. swiped away to a full-screen app and returned) — resume
-    // capture immediately instead of waiting for the watchdog.
-    diag('visible_resume');
-    tryStartRecognition();
-  }
+
+// Recording survives a backgrounded tab now (MediaRecorder is not suspended the
+// way SpeechRecognition was), so there is nothing to resume on visibility change.
+// A close mid-recording still keeps every chunk already flushed to IndexedDB.
+window.addEventListener('pagehide', () => {
+  if (isRecording) diag('pagehide_recording', 'chunks:' + chunkSeq);
 });
 
-// ── Auth ─────────────────────────────────────────────────────────────────────
+// ── Auth / settings ──────────────────────────────────────────────────────────
 
-function saveKey() {
-  const val = document.getElementById('apiKeyInput').value.trim();
-  if (!val.startsWith('sk-ant-')) {
-    alert("That doesn't look like an Anthropic API key. It should start with sk-ant-");
-    return;
-  }
-  apiKey = val;
-  localStorage.setItem('scribe_key', val);
+function hasKeys() { return !!apiKey && !!assemblyKey; }
+
+function showMain() {
   document.getElementById('setupCard').classList.add('hidden');
   document.getElementById('mainInterface').classList.remove('hidden');
+}
+
+function prefillSetup() {
+  document.getElementById('apiKeyInput').value = apiKey;
+  document.getElementById('assemblyKeyInput').value = assemblyKey;
+  document.getElementById('setupCard').classList.remove('hidden');
+}
+
+function showSettings() {
+  prefillSetup();
+  document.getElementById('setupCard').scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+function saveKeys() {
+  const anthropic = document.getElementById('apiKeyInput').value.trim();
+  const assembly  = document.getElementById('assemblyKeyInput').value.trim();
+  const err = document.getElementById('setupError');
+
+  if (!isLikelyAnthropicKey(anthropic)) {
+    err.textContent = "That doesn't look like an Anthropic key — it should start with sk-ant-";
+    err.classList.add('visible');
+    return;
+  }
+  if (!isLikelyAssemblyKey(assembly)) {
+    err.textContent = "That doesn't look like an AssemblyAI key — copy it from assemblyai.com/app.";
+    err.classList.add('visible');
+    return;
+  }
+
+  apiKey = anthropic;
+  assemblyKey = assembly;
+  localStorage.setItem('scribe_key', anthropic);
+  localStorage.setItem('scribe_assembly_key', assembly);
+  err.classList.remove('visible');
+  showMain();
   maybeOfferRestore();
+  resumeUnfinishedWork();
+  renderCredits();
+}
+
+// ── Audio store (IndexedDB) ───────────────────────────────────────────────────
+//
+// localStorage cannot hold audio (5 MB cap, strings only). Chunks are stored
+// individually under [sessionId, seq] so each 5-second flush is a small write
+// rather than a rewrite of the whole growing recording.
+
+const AUDIO_DB = 'scribe_audio';
+const AUDIO_STORE = 'chunks';
+let audioDbPromise = null;
+
+function audioDB() {
+  if (audioDbPromise) return audioDbPromise;
+  audioDbPromise = new Promise((resolve, reject) => {
+    let req;
+    try { req = indexedDB.open(AUDIO_DB, 1); }
+    catch (e) { reject(e); return; }
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(AUDIO_STORE)) {
+        const store = db.createObjectStore(AUDIO_STORE, { keyPath: ['sessionId', 'seq'] });
+        store.createIndex('bySession', 'sessionId', { unique: false });
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror   = () => reject(req.error);
+  });
+  return audioDbPromise;
+}
+
+function putAudioChunk(sessionId, seq, blob, mime) {
+  return audioDB().then(db => new Promise((resolve, reject) => {
+    const tx = db.transaction(AUDIO_STORE, 'readwrite');
+    tx.objectStore(AUDIO_STORE).put({ sessionId, seq, blob, mime });
+    tx.oncomplete = () => resolve();
+    tx.onerror    = () => reject(tx.error);
+    tx.onabort    = () => reject(tx.error);
+  }));
+}
+
+function getAudioBlob(sessionId) {
+  return audioDB().then(db => new Promise((resolve, reject) => {
+    const tx  = db.transaction(AUDIO_STORE, 'readonly');
+    const req = tx.objectStore(AUDIO_STORE).index('bySession').getAll(sessionId);
+    req.onsuccess = () => {
+      const rows = (req.result || []).slice().sort((a, b) => a.seq - b.seq);
+      if (!rows.length) { resolve(null); return; }
+      resolve(new Blob(rows.map(r => r.blob), { type: rows[0].mime || 'audio/webm' }));
+    };
+    req.onerror = () => reject(req.error);
+  }));
+}
+
+function deleteAudio(sessionId) {
+  return audioDB().then(db => new Promise((resolve) => {
+    const tx    = db.transaction(AUDIO_STORE, 'readwrite');
+    const store = tx.objectStore(AUDIO_STORE);
+    const req   = store.index('bySession').getAllKeys(sessionId);
+    req.onsuccess = () => { (req.result || []).forEach(k => store.delete(k)); };
+    tx.oncomplete = () => resolve();
+    tx.onerror    = () => resolve();   // best-effort cleanup, never fatal
+  })).catch(() => {});
+}
+
+// Drop audio for old sessions that already have a finished note. Never touches a
+// session that still owes a transcript or a note — that audio is the only copy.
+function pruneAudio() {
+  const ids = selectAudioToPrune(sessions, AUDIO_KEEP_RECENT);
+  if (!ids.length) return;
+  Promise.all(ids.map(deleteAudio)).then(() => {
+    let changed = false;
+    ids.forEach(id => {
+      const s = sessions.find(x => x.id === id);
+      if (s && s.hasAudio) { s.hasAudio = false; changed = true; }
+    });
+    if (changed) saveSessions();
+    diag('audio_pruned', 'count:' + ids.length);
+  });
 }
 
 // ── Recording ────────────────────────────────────────────────────────────────
+
+function mimeSupported(type) {
+  try { return typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(type); }
+  catch (e) { return false; }
+}
 
 function toggleRecord() {
   if (!isRecording) startRecording();
   else stopRecording();
 }
 
-function startRecording() {
-  if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
-    showError('Speech recognition is not supported in this browser. Please use Chrome or Edge.');
+async function startRecording() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || typeof MediaRecorder === 'undefined') {
+    showError('This browser cannot record audio. Please use a current version of Safari, Chrome, or Edge.');
     return;
   }
 
-  // Reset per-recording state, then build and start the recognizer. The previous
-  // transcript (if any) is already in history — persisted when it was stopped —
-  // so dropping it here can no longer lose anything.
-  transcript       = '';
-  sessionBase      = '';
-  hasResult        = false;
-  recogRunning     = false;
-  starting         = false;
-  reconnecting     = false;
-  sessionHadSpeech = false;
-  restartScheduled = false;
-  restartDelay     = RESTART_MIN_MS;
-  restartCount     = 0;
-  lastResultTime   = Date.now();
-  isRecording      = true;
+  hideError();
+  hideRestore();
 
-  // Each recording is its own history entry, dated by when it was recorded
-  // (not by when it later gets saved or a note generated).
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
+  } catch (e) {
+    diag('mic_error', (e && e.name) || 'error');
+    showError(micErrorMessage(e && e.name));
+    return;
+  }
+
+  // Reset per-recording state. The previous session is already in history, so
+  // clearing here cannot lose anything.
+  mediaStream = stream;
+  transcript  = '';
+  chunkSeq    = 0;
+  chunkErrors = 0;
+  sawSound    = false;
+  isRecording = true;
+
+  // Each recording is its own history entry, dated by when it was recorded.
   currentSessionId = Date.now();
   sessionStartISO  = new Date().toISOString();
-  lastPersistedTranscript = null;
 
-  diag('record_start');
-  bankPendingDraft();     // starting fresh — an unrestored crash draft goes to
-  hideRestore();          // history instead of being overwritten by this recording
-  hideError();
-  recognition = makeRecognition();
-  tryStartRecognition();
+  audioMime = pickAudioMime(mimeSupported);
+  const opts = { audioBitsPerSecond: AUDIO_BPS };
+  if (audioMime) opts.mimeType = audioMime;
+  try {
+    mediaRecorder = new MediaRecorder(stream, opts);
+  } catch (e) {
+    // A browser can advertise a type and still refuse the options object —
+    // fall back to its own defaults rather than failing the session.
+    diag('recorder_opts_rejected', (e && e.name) || 'error');
+    try {
+      mediaRecorder = new MediaRecorder(stream);
+      audioMime = mediaRecorder.mimeType || '';
+    } catch (e2) {
+      diag('recorder_error', (e2 && e2.name) || 'error');
+      showError('Could not start the audio recorder in this browser. Please use Safari, Chrome, or Edge.');
+      releaseStream();
+      isRecording = false;
+      return;
+    }
+  }
+  if (!audioMime) audioMime = mediaRecorder.mimeType || '';
+
+  mediaRecorder.ondataavailable = (e) => {
+    if (!e.data || !e.data.size) return;
+    const seq = chunkSeq++;
+    const sid = currentSessionId;
+    putAudioChunk(sid, seq, e.data, audioMime)
+      .then(() => { if (seq === 0) diag('audio_first_chunk', 'bytes:' + e.data.size); })
+      .catch((err) => {
+        chunkErrors++;
+        diag('audio_chunk_error', (err && err.name) || 'error');
+        if (chunkErrors === 1) {
+          showError('Warning: this browser is refusing to save audio to disk (storage may be full). ' +
+                    'The session is still recording, but it may not survive a crash — finish and check the note.');
+        }
+      });
+  };
+
+  // A track that ends or mutes on its own means the mic genuinely went away
+  // (unplugged, grabbed by another app). That is worth interrupting for.
+  stream.getAudioTracks().forEach(track => {
+    track.onended = () => {
+      if (!isRecording) return;
+      diag('track_ended');
+      showError('The microphone stopped unexpectedly. Recording has been stopped — the audio up to this point is saved.');
+      stopRecording();
+    };
+  });
+
+  try {
+    mediaRecorder.start(CHUNK_MS);
+  } catch (e) {
+    diag('recorder_start_error', (e && e.name) || 'error');
+    showError('Could not start recording: ' + ((e && e.name) || 'unknown error'));
+    releaseStream();
+    isRecording = false;
+    return;
+  }
+
+  diag('record_start', 'mime:' + (audioMime || 'default'));
+  startMeter(stream);
 
   document.getElementById('recordBtn').classList.add('recording');
   document.getElementById('micIcon').style.display = 'none';
@@ -172,12 +357,15 @@ function startRecording() {
   document.getElementById('ring1').classList.add('active');
   document.getElementById('ring2').classList.add('active');
   document.getElementById('ring3').classList.add('active');
-  document.getElementById('transcriptSection').classList.add('visible');
-  document.getElementById('transcriptCursor').classList.remove('hidden');
   document.getElementById('waveform').classList.add('active');
   document.getElementById('timer').classList.add('visible');
+  document.getElementById('transcriptSection').classList.add('visible');
+  document.getElementById('generateBtn').classList.remove('ready');
+  setTranscriptPlaceholder('Recording. The transcript is produced after you press stop.');
+  setTranscribeStatus('', '');
 
   timerSeconds = 0;
+  document.getElementById('timer').textContent = '00:00';
   timerInterval = setInterval(() => {
     timerSeconds++;
     const m = String(Math.floor(timerSeconds / 60)).padStart(2, '0');
@@ -185,181 +373,32 @@ function startRecording() {
     document.getElementById('timer').textContent = m + ':' + s;
   }, 1000);
 
-  // The waveform animates purely in CSS now (no per-frame JS / layout thrash).
-
-  // Persist the transcript every 10s so a browser timeout can't lose the intake.
-  draftInterval = setInterval(saveDraft, 10000);
-
-  // Watchdog: keep recognition alive without churning it. It does NOT stop a
-  // healthy session on mere silence (that was triggering Safari's restart-abuse
-  // block). It only acts when capture is actually down, or a session has gone
-  // silent-but-"running" for an implausibly long time (a Safari zombie).
-  watchdogInterval = setInterval(() => {
-    if (!isRecording) return;
-    if (!recogRunning && !starting && !restartScheduled) {
-      diag('watchdog', 'capture-down; restarting');
-      setCapturing(false);
-      tryStartRecognition();
-    } else if (recogRunning && Date.now() - lastResultTime > ZOMBIE_MS) {
-      diag('watchdog', 'zombie; recreating');
-      recreateRecognition();
-      scheduleRestart(RESTART_MIN_MS);
+  // If nothing at all registers on the meter early on, the wrong input device is
+  // almost certainly selected. Say so once, then stop nagging.
+  clearTimeout(silenceTimer);
+  silenceTimer = setTimeout(() => {
+    if (isRecording && !sawSound) {
+      diag('no_sound_detected');
+      showError('No sound is reaching the microphone. Check the input device in ' +
+                'System Settings ▸ Sound ▸ Input — the recording is still running.');
     }
-  }, 4000);
-}
-
-// Build a configured SpeechRecognition with all handlers wired to module state.
-function makeRecognition() {
-  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-  const r = new SR();
-  r.continuous = true;
-  r.interimResults = true;
-  r.lang = 'en-US';
-
-  r.onstart = () => {
-    starting = false;
-    recogRunning = true;
-    sessionHadSpeech = false;   // fresh session — no speech captured yet
-    diag('recognition_started');
-  };
-
-  r.onresult = (e) => {
-    const results = [];
-    for (let i = 0; i < e.results.length; i++) {
-      results.push({ transcript: e.results[i][0].transcript, isFinal: e.results[i].isFinal });
-    }
-    const built = buildTranscript(sessionBase, results);
-    transcript = built.text;
-    r._lastFinal = built.final;   // carried into sessionBase on restart
-    hasResult = true;
-    sessionHadSpeech = true;
-    lastResultTime = Date.now();
-    restartDelay = RESTART_MIN_MS;   // real capture — reset backoff
-    setCapturing(true);              // clears any "reconnecting" state
-    // We're clearly capturing — clear any earlier (transient) error banner.
-    if (document.getElementById('errorMsg').classList.contains('visible')) hideError();
-    scheduleTranscriptRender();
-    document.getElementById('generateBtn').classList.add('ready');
-  };
-
-  r.onerror = (e) => {
-    diag('recognition_error', e.error);
-    starting = false;
-    // Only alarm the user for a *persistent* block: never captured anything AND
-    // we've already retried a couple of times (Safari throws a spurious
-    // not-allowed on some restarts that recovers on its own). This avoids
-    // flashing a scary banner for a one-off hiccup at the very start.
-    if (!hasResult && restartCount >= 2 && !isTransientRecognitionError(e.error)) {
-      showError(friendlyRecognitionError(e.error));
-    }
-  };
-
-  r.onend = () => {
-    recogRunning = false;
-    starting = false;
-    if (isRecording) {
-      sessionBase = r._lastFinal || transcript;
-      // Restart fast if we were mid-conversation (a natural pause), slower if the
-      // session heard nothing (pure silence) so we don't churn/beep every ~5s.
-      const delay = sessionHadSpeech ? RESTART_MIN_MS : RESTART_SILENCE_MS;
-      diag('recognition_end', sessionHadSpeech ? 'restart-fast' : 'restart-idle');
-      scheduleRestart(delay);
-    } else {
-      diag('recognition_end', 'stopped');
-    }
-  };
-
-  return r;
-}
-
-function scheduleRestart(delay) {
-  if (restartScheduled) return;
-  restartScheduled = true;
-  restartCount++;
-  setTimeout(() => {
-    restartScheduled = false;
-    if (isRecording) tryStartRecognition();
-  }, delay != null ? delay : restartDelay);
-}
-
-// Start recognition, tolerating Safari's habit of throwing on rapid restarts.
-// On failure it backs off exponentially and recreates the recognizer, and never
-// gives up while the user still intends to record.
-function tryStartRecognition() {
-  if (!isRecording || recogRunning || starting) return;
-  starting = true;
-  try {
-    recognition.start();
-    // If onstart never confirms, clear the flag so the watchdog can retry.
-    setTimeout(() => { starting = false; }, 1500);
-  } catch (e) {
-    starting = false;
-    diag('start_throw', (e && e.name) || 'error');
-    setCapturing(false);
-    restartDelay = Math.min(restartDelay * 2, RESTART_MAX_MS);
-    recreateRecognition();
-    scheduleRestart(restartDelay);
-  }
-}
-
-// Detach the old recognizer's handlers and build a fresh one (Safari sometimes
-// wedges an instance so only a new object will start cleanly).
-function recreateRecognition() {
-  if (recognition) {
-    try { recognition.onend = recognition.onerror = recognition.onresult = recognition.onstart = null; } catch (e) {}
-    try { recognition.abort ? recognition.abort() : recognition.stop(); } catch (e) {}
-  }
-  recogRunning = false;
-  starting = false;
-  recognition = makeRecognition();
-}
-
-// Toggle the honest "reconnecting" vs "recording" status. Capture being down
-// means audio is genuinely being missed, so we say so rather than pretend.
-function setCapturing(alive) {
-  const label = document.getElementById('recordLabel');
-  const dot   = document.getElementById('statusDot');
-  if (alive) {
-    if (!reconnecting) return;
-    reconnecting = false;
-    if (isRecording) {
-      label.textContent = 'Recording — tap to stop';
-      dot.className = 'status-dot live';
-    }
-    if (document.getElementById('errorMsg').classList.contains('visible')) hideError();
-  } else {
-    if (reconnecting || !isRecording) return;
-    reconnecting = true;
-    if (hasResult) {
-      // We had a working stream and lost it — be honest that audio may be missed.
-      label.textContent = 'Reconnecting to speech service — audio may be missed briefly';
-      dot.className = 'status-dot reconnecting';
-      diag('reconnecting');
-    } else {
-      // Nothing captured yet — this is just Safari's no-speech timeout cycling
-      // while the room is quiet. Keep it calm; we're armed and waiting.
-      label.textContent = 'Listening — start speaking to begin the transcript';
-      dot.className = 'status-dot live';
-      diag('listening_idle');
-    }
-  }
+  }, SILENCE_HINT_MS);
 }
 
 function stopRecording() {
-  isRecording = false;   // set first so onend does not schedule a restart
-  recogRunning = false;
-  starting = false;
-  reconnecting = false;
-  restartScheduled = false;
-  if (recognition) { try { recognition.stop(); } catch (e) {} }
+  if (!isRecording) return;
+  isRecording = false;
   clearInterval(timerInterval);
-  clearInterval(draftInterval);
-  clearInterval(watchdogInterval);
-  saveDraft();
-  diag('record_stop', 'dur:' + timerSeconds + 's restarts:' + restartCount);
-  // Commit the transcript to permanent history right now — not at New Session.
-  // A generate error, crash, or closed tab after this point can't lose it.
-  persistSession();
+  clearTimeout(silenceTimer);
+  stopMeter();
+
+  const finish = () => { releaseStream(); finishRecording(); };
+  if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+    mediaRecorder.onstop = finish;
+    try { mediaRecorder.stop(); } catch (e) { finish(); }
+  } else {
+    finish();
+  }
 
   document.getElementById('recordBtn').classList.remove('recording');
   document.getElementById('micIcon').style.display = 'block';
@@ -370,134 +409,321 @@ function stopRecording() {
   document.getElementById('ring2').classList.remove('active');
   document.getElementById('ring3').classList.remove('active');
   document.getElementById('waveform').classList.remove('active');
-  document.getElementById('transcriptCursor').classList.add('hidden');
-
-  updateTranscriptDisplay(transcript);
-  checkSafetyDoc();
 }
 
-function updateTranscriptDisplay(text) {
-  if (text.trim()) {
-    document.getElementById('transcriptPlaceholder').style.display = 'none';
-    document.getElementById('transcriptText').textContent = text;
+// Runs once MediaRecorder has flushed its final chunk: the recording is now
+// complete on disk. Persist the session first, then start transcription — in
+// that order, so a failure in the second step can never affect the first.
+function finishRecording() {
+  diag('record_stop', 'dur:' + timerSeconds + 's chunks:' + chunkSeq + ' errs:' + chunkErrors);
+  if (!chunkSeq) {
+    showError('No audio was captured for this session. Check the microphone input and try again.');
+    setTranscriptPlaceholder('No audio was captured.');
+    return;
   }
+  persistSession({ hasAudio: true, audioMime, transcriptionStatus: 'queued' });
+  pruneAudio();
+  transcribeSession(currentSessionId);
 }
 
-// Throttle DOM writes: re-rendering the whole (growing) transcript on every
-// interim result is what heats an older laptop up. Repaint at most every 400ms.
-function scheduleTranscriptRender() {
-  const now = Date.now();
-  const elapsed = now - lastRenderTime;
-  if (elapsed >= RENDER_MS) {
-    lastRenderTime = now;
-    updateTranscriptDisplay(transcript);
-  } else if (!renderPending) {
-    renderPending = true;
-    setTimeout(() => {
-      renderPending = false;
-      lastRenderTime = Date.now();
-      updateTranscriptDisplay(transcript);
-    }, RENDER_MS - elapsed);
+function releaseStream() {
+  if (mediaStream) {
+    try { mediaStream.getTracks().forEach(t => t.stop()); } catch (e) {}
   }
+  mediaStream = null;
+  mediaRecorder = null;
 }
 
-// ── Auto-save / crash recovery ─────────────────────────────────────────────────
+// ── Level meter ───────────────────────────────────────────────────────────────
+//
+// Honest proof of capture: the bars are driven by the *same* MediaStream being
+// written to disk, so movement means audio is genuinely arriving. (The old
+// waveform was a fixed CSS animation that ran whether or not the mic worked.)
+// Only `transform` is written — compositor-only, no layout or paint — and
+// repaints are gated to ~12fps, so this stays far cheaper than the per-frame
+// height mutation that used to spin the fan up.
 
-function saveDraft() {
-  if (!transcript.trim()) return;
-  if (transcript === lastPersistedTranscript) return; // already safe in history
+function prefersReducedMotion() {
+  try { return window.matchMedia('(prefers-reduced-motion: reduce)').matches; }
+  catch (e) { return false; }
+}
+
+function startMeter(stream) {
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx) return;
+  if (prefersReducedMotion()) {
+    // Still detect sound (for the wrong-input hint) but do not animate.
+    sawSound = true;
+    return;
+  }
   try {
-    localStorage.setItem(DRAFT_KEY, serializeDraft(transcript, timerSeconds, new Date().toISOString()));
-    diag('draft_saved', 'len:' + transcript.length);
-  } catch (e) {}
-}
-
-function loadDraft() {
-  try { return JSON.parse(localStorage.getItem(DRAFT_KEY) || 'null'); }
-  catch (e) { return null; }
-}
-
-function clearDraft() {
-  try { localStorage.removeItem(DRAFT_KEY); } catch (e) {}
-}
-
-function maybeOfferRestore() {
-  const draft = loadDraft();
-  if (!isDraftRestorable(draft)) return;
-  pendingDraft = draft;
-  const when = draft.savedAt ? new Date(draft.savedAt) : null;
-  document.getElementById('restoreBannerText').textContent =
-    'Recovered an unsaved transcript' +
-    (when ? ' from ' + when.toLocaleString() : '') + '. Restore it?';
-  document.getElementById('restoreBanner').classList.remove('hidden');
-}
-
-function restoreDraft() {
-  if (!pendingDraft) return;
-  transcript   = pendingDraft.transcript || '';
-  timerSeconds = pendingDraft.duration || 0;
-  // Give the recovered transcript its own history entry, dated by when the
-  // draft was last captured, and commit it immediately.
-  currentSessionId = Date.now();
-  sessionStartISO  = pendingDraft.savedAt || new Date().toISOString();
-  lastPersistedTranscript = null;
-  pendingDraft = null;
-  persistSession();
-
-  const m = String(Math.floor(timerSeconds / 60)).padStart(2, '0');
-  const s = String(timerSeconds % 60).padStart(2, '0');
-  document.getElementById('timer').textContent = m + ':' + s;
-  document.getElementById('timer').classList.add('visible');
-  document.getElementById('transcriptText').textContent = transcript;
-  document.getElementById('transcriptPlaceholder').style.display = 'none';
-  document.getElementById('transcriptSection').classList.add('visible');
-  document.getElementById('generateBtn').classList.add('ready');
-  document.getElementById('recordLabel').textContent = 'Recovered — review, then Generate SOAP Note';
-  checkSafetyDoc();
-  diag('draft_restored');
-  hideRestore();
-}
-
-// Called when a new recording starts while an unrestored crash draft is still
-// pending: commit it to history as its own session (dated by when it was
-// captured) so the new recording can't overwrite the only copy. Explicitly
-// clicking Discard still discards.
-function bankPendingDraft() {
-  if (!pendingDraft || !isDraftRestorable(pendingDraft)) { pendingDraft = null; return; }
-  let id = Date.now();
-  while (id === currentSessionId || sessions.some(s => s.id === id)) id++;
-  const session = {
-    id:         id,
-    date:       pendingDraft.savedAt || new Date().toISOString(),
-    duration:   pendingDraft.duration || 0,
-    transcript: pendingDraft.transcript,
-    soap:       null,
-  };
-  try {
-    sessions = upsertSession(sessions, session, 100);
-    localStorage.setItem('scribe_sessions', JSON.stringify(sessions));
-    clearDraft();
-    renderSidebar();
-    diag('draft_banked', 'len:' + session.transcript.length);
+    audioCtx = new Ctx();
+    const source = audioCtx.createMediaStreamSource(stream);
+    analyserNode = audioCtx.createAnalyser();
+    analyserNode.fftSize = 64;
+    analyserNode.smoothingTimeConstant = 0.75;
+    source.connect(analyserNode);
   } catch (e) {
-    diag('persist_error', (e && e.name) || 'error');  // keep the draft copy
+    diag('meter_error', (e && e.name) || 'error');
+    sawSound = true;   // cannot measure — do not raise a false "no sound" alarm
+    return;
   }
-  pendingDraft = null;
+
+  const bins = new Uint8Array(analyserNode.frequencyBinCount);
+  const bars = Array.prototype.slice.call(document.querySelectorAll('#waveform .bar'));
+  document.getElementById('waveform').classList.add('metered');
+  let last = 0;
+
+  const tick = (now) => {
+    if (!isRecording) return;
+    meterRAF = requestAnimationFrame(tick);
+    if (now - last < METER_MS) return;
+    last = now;
+    analyserNode.getByteFrequencyData(bins);
+    let peak = 0;
+    for (let i = 0; i < bars.length; i++) {
+      const v = (bins[i + 1] || 0) / 255;
+      if (v > peak) peak = v;
+      const scale = Math.max(0.12, Math.min(1, v * 1.8));
+      bars[i].style.transform = 'scaleY(' + scale.toFixed(2) + ')';
+    }
+    if (peak > 0.06) {
+      sawSound = true;
+      if (document.getElementById('errorMsg').textContent.indexOf('No sound is reaching') === 0) hideError();
+    }
+  };
+  meterRAF = requestAnimationFrame(tick);
 }
 
-function discardDraft() {
-  pendingDraft = null;
-  clearDraft();
-  hideRestore();
+function stopMeter() {
+  if (meterRAF) cancelAnimationFrame(meterRAF);
+  meterRAF = null;
+  const wave = document.getElementById('waveform');
+  wave.classList.remove('metered');
+  Array.prototype.slice.call(document.querySelectorAll('#waveform .bar'))
+    .forEach(b => { b.style.transform = ''; });
+  if (audioCtx) { try { audioCtx.close(); } catch (e) {} }
+  audioCtx = null;
+  analyserNode = null;
 }
 
-function hideRestore() {
-  document.getElementById('restoreBanner').classList.add('hidden');
+// ── Transcription (AssemblyAI) ────────────────────────────────────────────────
+
+function assemblyHeaders(extra) {
+  return Object.assign({ authorization: assemblyKey }, extra || {});
+}
+
+async function assemblyUpload(blob) {
+  let res;
+  try {
+    res = await fetch(ASSEMBLY_BASE + '/v2/upload', {
+      method: 'POST',
+      headers: assemblyHeaders({ 'content-type': 'application/octet-stream' }),
+      body: blob,
+    });
+  } catch (e) {
+    throw new Error(assemblyErrorMessage(0, ''));
+  }
+  if (!res.ok) throw new Error(assemblyErrorMessage(res.status, await res.text().catch(() => '')));
+  const data = await res.json();
+  if (!data.upload_url) throw new Error(assemblyErrorMessage(0, 'no upload url returned'));
+  return data.upload_url;
+}
+
+async function assemblySubmit(audioUrl) {
+  let res;
+  try {
+    res = await fetch(ASSEMBLY_BASE + '/v2/transcript', {
+      method: 'POST',
+      headers: assemblyHeaders({ 'content-type': 'application/json' }),
+      body: JSON.stringify({
+        audio_url: audioUrl,
+        speech_models: ['universal-3-5-pro'],
+        domain: 'medical-v1',      // medication / dosage / condition accuracy
+        speaker_labels: true,      // who said what → a much better S section
+        punctuate: true,
+        format_text: true,
+        language_code: 'en_us',
+      }),
+    });
+  } catch (e) {
+    throw new Error(assemblyErrorMessage(0, ''));
+  }
+  if (!res.ok) throw new Error(assemblyErrorMessage(res.status, await res.text().catch(() => '')));
+  const data = await res.json();
+  if (!data.id) throw new Error(assemblyErrorMessage(0, 'no transcript id returned'));
+  return data.id;
+}
+
+async function assemblyFetch(id) {
+  let res;
+  try {
+    res = await fetch(ASSEMBLY_BASE + '/v2/transcript/' + encodeURIComponent(id), {
+      headers: assemblyHeaders(),
+    });
+  } catch (e) {
+    throw new Error(assemblyErrorMessage(0, ''));
+  }
+  if (!res.ok) throw new Error(assemblyErrorMessage(res.status, await res.text().catch(() => '')));
+  return res.json();
+}
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+// Upload → submit → poll. Safe to call for any session id, live or historical.
+// Every state change is written to the session record, so closing the tab
+// mid-transcription loses nothing: resumeUnfinishedWork() picks it back up.
+async function transcribeSession(sessionId, opts) {
+  if (inFlight.has(sessionId)) return;
+  inFlight.add(sessionId);
+  const resuming = !!(opts && opts.resume);
+
+  try {
+    hideError();
+    updateSession(sessionId, { transcriptionStatus: 'uploading', transcriptionError: null });
+    if (isDisplayed(sessionId)) setTranscribeStatus('uploading');
+
+    let assemblyId = resuming ? (findSession(sessionId) || {}).assemblyId : null;
+
+    if (!assemblyId) {
+      const blob = await getAudioBlob(sessionId);
+      if (!blob || !blob.size) throw new Error('The audio for this session is no longer in this browser, so it cannot be transcribed.');
+      diag('upload_start', 'bytes:' + blob.size);
+      const uploadUrl = await assemblyUpload(blob);
+      assemblyId = await assemblySubmit(uploadUrl);
+      updateSession(sessionId, { assemblyId, transcriptionStatus: 'queued' });
+      diag('transcribe_submitted');
+    }
+
+    if (isDisplayed(sessionId)) setTranscribeStatus('queued');
+
+    const started = Date.now();
+    let result = null;
+    while (Date.now() - started < POLL_MAX_MS) {
+      await sleep(POLL_MS);
+      const data = await assemblyFetch(assemblyId);
+      if (data.status === 'completed') { result = data; break; }
+      if (data.status === 'error') throw new Error('AssemblyAI could not transcribe this audio: ' + (data.error || 'unknown reason'));
+      if (data.status !== (findSession(sessionId) || {}).transcriptionStatus) {
+        updateSession(sessionId, { transcriptionStatus: data.status });
+        if (isDisplayed(sessionId)) setTranscribeStatus(data.status);
+      }
+    }
+    if (!result) throw new Error('Transcription is taking unusually long. The audio is saved — retry from the sidebar.');
+
+    const text = buildUtteranceTranscript(result.utterances, result.text);
+    const secs = Math.round(Number(result.audio_duration) || 0);
+    recordUsage(secs);
+
+    updateSession(sessionId, {
+      transcript: text,
+      transcriptionStatus: 'completed',
+      transcriptionError: null,
+      audioSeconds: secs,
+      duration: secs || (findSession(sessionId) || {}).duration,
+    });
+    diag('transcribe_ok', 'dur:' + secs + 's conf:' + (result.confidence || '?'));
+
+    if (isDisplayed(sessionId)) {
+      transcript = text;
+      setTranscribeStatus('completed');
+      renderTranscript(text);
+      checkSafetyDoc();
+      document.getElementById('generateBtn').classList.remove('hidden');
+      document.getElementById('generateBtn').classList.add('ready');
+      document.getElementById('recordLabel').textContent = 'Transcript ready — generate the note';
+    }
+    renderSidebar();
+    renderCredits();
+
+  } catch (err) {
+    diag('transcribe_error', String(err && err.message || err).slice(0, 120));
+    updateSession(sessionId, { transcriptionStatus: 'error', transcriptionError: String(err && err.message || err) });
+    if (isDisplayed(sessionId)) {
+      setTranscribeStatus('error');
+      showError(String(err && err.message || err));
+      showRetry(sessionId);
+    }
+    renderSidebar();
+  } finally {
+    inFlight.delete(sessionId);
+  }
+}
+
+function retryTranscription(sessionId) {
+  hideError();
+  hideRetry();
+  transcribeSession(sessionId);
+}
+
+// On load, pick up anything left mid-flight by a closed tab: a session that was
+// submitted to AssemblyAI (poll it again — the result is waiting server-side), or
+// one that has audio but never got a transcript at all.
+function resumeUnfinishedWork() {
+  const pending = sessions.filter(s => needsTranscription(s));
+  if (!pending.length) return;
+  diag('resume_pending', 'count:' + pending.length);
+  const banner = document.getElementById('pendingBanner');
+  const resumable = pending.filter(s => s.assemblyId);
+  // Resume server-side jobs silently — the result is already paid for.
+  resumable.slice(0, 3).forEach(s => transcribeSession(s.id, { resume: true }));
+  const stalled = pending.filter(s => !s.assemblyId);
+  if (stalled.length) {
+    document.getElementById('pendingBannerText').textContent =
+      stalled.length === 1
+        ? 'One recorded session has no transcript yet. Its audio is saved.'
+        : stalled.length + ' recorded sessions have no transcript yet. Their audio is saved.';
+    banner.dataset.ids = stalled.map(s => s.id).join(',');
+    banner.classList.remove('hidden');
+  }
+}
+
+function transcribePending() {
+  const banner = document.getElementById('pendingBanner');
+  const ids = (banner.dataset.ids || '').split(',').filter(Boolean).map(Number);
+  banner.classList.add('hidden');
+  ids.forEach(id => transcribeSession(id));
+}
+
+// ── Usage / credit estimate ───────────────────────────────────────────────────
+
+function loadUsage() {
+  try { return JSON.parse(localStorage.getItem(USAGE_KEY) || '{"seconds":0}'); }
+  catch (e) { return { seconds: 0 }; }
+}
+
+function recordUsage(seconds) {
+  const usage = loadUsage();
+  usage.seconds = (Number(usage.seconds) || 0) + (Number(seconds) || 0);
+  try { localStorage.setItem(USAGE_KEY, JSON.stringify(usage)); } catch (e) {}
+}
+
+function renderCredits() {
+  const el = document.getElementById('creditMeter');
+  if (!el) return;
+  const usage  = loadUsage();
+  const spent  = estimateCost(usage.seconds);
+  const status = creditStatus(spent);
+  const hrs    = hoursRemaining(status.remaining);
+
+  el.className = 'credit-meter ' + status.level;
+  if (status.level === 'empty') {
+    el.textContent = 'AssemblyAI free credits are estimated to be used up — top up at assemblyai.com/app.';
+  } else if (status.level === 'low') {
+    el.textContent = 'About ' + formatUsd(status.remaining) + ' of AssemblyAI credit left (~' +
+                     Math.round(hrs) + ' more hours). Top up soon at assemblyai.com/app.';
+  } else {
+    el.textContent = 'Estimated AssemblyAI credit: ' + formatUsd(status.remaining) + ' left (~' +
+                     Math.round(hrs) + ' hours of recording).';
+  }
+  el.classList.toggle('hidden', !hasKeys());
 }
 
 // ── SOAP generation ──────────────────────────────────────────────────────────
 
-const SOAP_PROMPT = `You are a medical scribe assistant for a psychiatrist. Below is a raw transcript from a patient session. Convert it into a structured SOAP note.
+const SOAP_PROMPT = `You are a medical scribe assistant for a psychiatrist. Below is a transcript from a patient session. Convert it into a structured SOAP note.
+
+The transcript is diarized: each line is prefixed with a speaker label such as "Speaker A:". The labels are anonymous — infer from context which speaker is the clinician and which is the patient (the clinician typically asks the questions, and discusses medication and plan). Use that separation: what the patient says belongs in S, what the clinician observes or decides belongs in O/A/P. Never attribute a statement to the wrong party.
 
 Return ONLY a JSON object with exactly these four keys: "S", "O", "A", "P"
 
@@ -517,7 +743,7 @@ Return ONLY a JSON object with exactly these four keys: "S", "O", "A", "P"
 - A (Assessment): Clinical impression, working diagnosis or differential, and any changes from prior sessions if mentioned.
 - P (Plan): Treatment plan, medication changes, referrals, follow-up timeline, psychotherapy approach, patient instructions.
 
-Be concise but clinically complete. Use proper psychiatric terminology. Do not add information not present in the transcript.
+Be concise but clinically complete. Use proper psychiatric terminology. Do not add information not present in the transcript. Transcription is automated and may contain errors — if a medication name or dosage is garbled, write it as heard rather than guessing a plausible substitute.
 
 TRANSCRIPT:
 {{transcript}}
@@ -525,12 +751,10 @@ TRANSCRIPT:
 Respond with only the JSON object, no markdown, no explanation.`;
 
 async function generateSOAP() {
-  // In view mode the button only shows for a saved session that has no note yet
-  // (e.g. generation failed on the day) — generate from its stored transcript.
-  const viewing = viewMode ? sessions.find(s => s.id === viewingSessionId) : null;
+  const viewing = viewMode ? findSession(viewingSessionId) : null;
   const sourceText = viewing ? (viewing.transcript || '') : transcript;
   if (!sourceText.trim()) return;
-  if (isRecording) stopRecording();
+  if (isRecording) { stopRecording(); return; }
 
   const btn = document.getElementById('generateBtn');
   btn.disabled = true;
@@ -548,19 +772,20 @@ async function generateSOAP() {
         'anthropic-dangerous-direct-browser-access': 'true'
       },
       body: JSON.stringify({
-        model: 'claude-sonnet-4-6',
-        max_tokens: 4000,
+        model: 'claude-opus-5',
+        max_tokens: 8000,
         messages: [{ role: 'user', content: SOAP_PROMPT.replace('{{transcript}}', sourceText) }]
       })
     });
 
     if (!response.ok) {
-      const err = await response.json();
-      throw new Error(err.error?.message || 'API error ' + response.status);
+      const err = await response.json().catch(() => ({}));
+      throw new Error((err.error && err.error.message) || 'API error ' + response.status);
     }
 
     const data = await response.json();
-    const parsed = parseSOAPResponse(data.content[0].text);
+    const textBlock = (data.content || []).find(b => b.type === 'text');
+    const parsed = parseSOAPResponse(textBlock ? textBlock.text : '');
 
     document.getElementById('soapS').textContent = parsed.S || '—';
     document.getElementById('soapO').textContent = parsed.O || '—';
@@ -568,16 +793,16 @@ async function generateSOAP() {
     document.getElementById('soapP').textContent = parsed.P || '—';
 
     if (viewing) {
-      // Attach the note to the saved session it was generated from.
       viewing.soap = readSoapFromDOM();
-      try { localStorage.setItem('scribe_sessions', JSON.stringify(sessions)); } catch (e) {}
+      saveSessions();
       ['soapS', 'soapO', 'soapA', 'soapP'].forEach(id => document.getElementById(id).removeAttribute('contenteditable'));
       renderSidebar();
-      document.querySelector(`.session-item[data-id="${viewing.id}"]`)?.classList.add('active');
+      const item = document.querySelector('.session-item[data-id="' + viewing.id + '"]');
+      if (item) item.classList.add('active');
       document.getElementById('generateBtn').classList.add('hidden');
     } else {
       soapData = parsed;
-      persistSession();  // the note is now saved with its session — no click needed
+      persistSession();
       document.getElementById('statusDot').className = 'status-dot done';
       document.getElementById('recordBtn').disabled = true;
       document.getElementById('recordLabel').textContent = 'Note generated and saved — click New Session to continue';
@@ -586,6 +811,7 @@ async function generateSOAP() {
     showCPT(viewing ? viewing.duration : timerSeconds);
     document.getElementById('soapSection').classList.add('visible');
     document.getElementById('soapSection').scrollIntoView({ behavior: 'smooth', block: 'start' });
+    pruneAudio();
     diag('generate_ok');
 
   } catch (err) {
@@ -663,6 +889,27 @@ function copySection(sectionId, btnEl) {
 
 // ── Session history ───────────────────────────────────────────────────────────
 
+function findSession(id) { return sessions.find(s => s.id === id) || null; }
+
+function saveSessions() {
+  try { localStorage.setItem('scribe_sessions', JSON.stringify(sessions)); return true; }
+  catch (e) { diag('persist_error', (e && e.name) || 'error'); return false; }
+}
+
+// Patch fields onto a stored session without disturbing the rest of it.
+function updateSession(id, patch) {
+  const s = findSession(id);
+  if (!s) return null;
+  Object.assign(s, patch);
+  saveSessions();
+  return s;
+}
+
+// Is this session the one currently on screen (live or being viewed)?
+function isDisplayed(id) {
+  return viewMode ? viewingSessionId === id : currentSessionId === id;
+}
+
 function formatDuration(s) {
   if (!s) return '';
   const m = Math.floor(s / 60);
@@ -681,10 +928,19 @@ function renderSidebar() {
     const dateStr = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
     const timeStr = d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
     const preview = s.transcript
-      ? s.transcript.slice(0, 50).trim() + (s.transcript.length > 50 ? '…' : '')
-      : 'No transcript';
-    const dur  = formatDuration(s.duration);
-    const flag = sessionHasNote(s) ? '' : '<span class="session-item-flag">No note yet</span>';
+      ? s.transcript.slice(0, 50).trim().replace(/</g, '&lt;') + (s.transcript.length > 50 ? '…' : '')
+      : (s.hasAudio ? 'Audio saved — no transcript yet' : 'No transcript');
+    const dur = formatDuration(s.duration);
+
+    let flag = '';
+    if (needsTranscription(s)) {
+      flag = s.transcriptionStatus === 'error'
+        ? '<span class="session-item-flag err">Needs transcript</span>'
+        : '<span class="session-item-flag">Transcribing…</span>';
+    } else if (!sessionHasNote(s)) {
+      flag = '<span class="session-item-flag">No note yet</span>';
+    }
+
     return `<div class="session-item" data-id="${s.id}" onclick="viewSession(${s.id})">
       <div class="session-item-meta">
         <span class="session-item-date">${dateStr} · ${timeStr}</span>
@@ -704,49 +960,36 @@ function readSoapFromDOM() {
   return [S, O, A, P].some(t => t.trim() && t.trim() !== '—') ? { S, O, A, P } : null;
 }
 
-// Upsert the in-progress session into permanent history. Runs at stop, after
-// note generation, on draft restore, and at New Session (captures SOAP edits) —
-// so a generate error, crash, or closed tab can no longer lose a transcript.
-// Returns true once the transcript is safely in history (the draft then goes).
-function persistSession() {
+// Upsert the in-progress session into permanent history. Runs at stop (with the
+// audio flags), after transcription, after note generation, and at New Session
+// (captures SOAP edits). `extra` merges additional fields for this write.
+function persistSession(extra) {
   const soap = readSoapFromDOM();
-  if (!transcript.trim() && !soap) return false;
+  const hasAudio = !!(extra && extra.hasAudio) || !!(findSession(currentSessionId) || {}).hasAudio;
+  if (!transcript.trim() && !soap && !hasAudio) return false;
   if (!currentSessionId) currentSessionId = Date.now();
   if (!sessionStartISO)  sessionStartISO  = new Date().toISOString();
-  const session = {
+
+  const existing = findSession(currentSessionId) || {};
+  const session = Object.assign({}, existing, {
     id:         currentSessionId,
     date:       sessionStartISO,
-    duration:   timerSeconds,
-    transcript: transcript,
-    soap:       soap,
-  };
-  try {
-    sessions = upsertSession(sessions, session, 100);
-    localStorage.setItem('scribe_sessions', JSON.stringify(sessions));
-  } catch (e) {
-    // Write failed (e.g. storage full) — keep the draft copy as the fallback.
-    diag('persist_error', (e && e.name) || 'error');
-    return false;
-  }
-  lastPersistedTranscript = transcript;
-  clearDraft();  // transcript is safely in history now — drop the recovery copy
+    // Prefer AssemblyAI's measured audio length once we have it — it is what was
+    // actually billed, and what the CPT tier should be judged on.
+    duration:   existing.audioSeconds || timerSeconds || existing.duration || 0,
+    transcript: transcript || existing.transcript || '',
+    soap:       soap || existing.soap || null,
+  }, extra || {});
+
+  sessions = upsertSession(sessions, session, 100);
+  if (!saveSessions()) return false;
   renderSidebar();
-  diag('session_persisted', 'len:' + transcript.length + (soap ? ' soap:yes' : ' soap:no'));
+  diag('session_persisted', 'len:' + session.transcript.length + (session.soap ? ' soap:yes' : ' soap:no'));
   return true;
 }
 
-// Whether a saved session has an actual note (older entries may carry an
-// all-empty soap object from before notes were saved with their session).
-function sessionHasNote(s) {
-  const soap = s && s.soap;
-  return !!soap && ['S', 'O', 'A', 'P'].some(k => {
-    const t = (soap[k] || '').trim();
-    return t && t !== '—';
-  });
-}
-
 function viewSession(id) {
-  const session = sessions.find(s => s.id === id);
+  const session = findSession(id);
   if (!session) return;
 
   if (!viewMode) {
@@ -772,7 +1015,8 @@ function viewSession(id) {
   if (isRecording) stopRecording();
 
   document.querySelectorAll('.session-item').forEach(el => el.classList.remove('active'));
-  document.querySelector(`.session-item[data-id="${id}"]`)?.classList.add('active');
+  const item = document.querySelector('.session-item[data-id="' + id + '"]');
+  if (item) item.classList.add('active');
 
   const d = new Date(session.date);
   document.getElementById('viewingBannerDate').textContent =
@@ -781,30 +1025,43 @@ function viewSession(id) {
 
   document.getElementById('viewingBanner').classList.remove('hidden');
   document.getElementById('recordSection').classList.add('hidden');
-  document.getElementById('transcriptPlaceholder').style.display = 'none';
-  document.getElementById('transcriptText').textContent = session.transcript || '';
-  document.getElementById('transcriptCursor').classList.add('hidden');
   document.getElementById('transcriptSection').classList.add('visible');
   document.getElementById('safetyWarning').classList.remove('visible');
   document.querySelector('.new-session-btn').classList.add('hidden');
   document.getElementById('cptRow').classList.remove('visible');
   hideError();
+  hideRetry();
 
-  if (sessionHasNote(session)) {
-    document.getElementById('soapS').textContent = session.soap.S || '—';
-    document.getElementById('soapO').textContent = session.soap.O || '—';
-    document.getElementById('soapA').textContent = session.soap.A || '—';
-    document.getElementById('soapP').textContent = session.soap.P || '—';
-    ['soapS', 'soapO', 'soapA', 'soapP'].forEach(id => document.getElementById(id).removeAttribute('contenteditable'));
-    document.getElementById('soapSection').classList.add('visible');
+  if (needsTranscription(session)) {
+    // Audio on disk, no transcript — offer to run (or re-run) transcription.
+    renderTranscript('');
+    setTranscriptPlaceholder('Audio is saved for this session but it has not been transcribed yet.');
+    setTranscribeStatus(inFlight.has(id) ? (session.transcriptionStatus || 'queued') : 'error');
+    if (!inFlight.has(id)) {
+      if (session.transcriptionError) showError(session.transcriptionError);
+      showRetry(id);
+    }
+    document.getElementById('soapSection').classList.remove('visible');
     document.getElementById('generateBtn').classList.add('hidden');
   } else {
-    // Saved transcript without a note (e.g. generation failed that day) —
-    // offer to generate it right here, from the stored transcript.
-    document.getElementById('soapSection').classList.remove('visible');
-    const gen = document.getElementById('generateBtn');
-    gen.classList.remove('hidden');
-    gen.classList.add('ready');
+    setTranscribeStatus('');
+    renderTranscript(session.transcript || '');
+    if (!(session.transcript || '').trim()) setTranscriptPlaceholder('No transcript for this session.');
+
+    if (sessionHasNote(session)) {
+      document.getElementById('soapS').textContent = session.soap.S || '—';
+      document.getElementById('soapO').textContent = session.soap.O || '—';
+      document.getElementById('soapA').textContent = session.soap.A || '—';
+      document.getElementById('soapP').textContent = session.soap.P || '—';
+      ['soapS', 'soapO', 'soapA', 'soapP'].forEach(x => document.getElementById(x).removeAttribute('contenteditable'));
+      document.getElementById('soapSection').classList.add('visible');
+      document.getElementById('generateBtn').classList.add('hidden');
+    } else {
+      document.getElementById('soapSection').classList.remove('visible');
+      const gen = document.getElementById('generateBtn');
+      gen.classList.remove('hidden');
+      gen.classList.add('ready');
+    }
   }
 
   window.scrollTo({ top: 0, behavior: 'smooth' });
@@ -821,14 +1078,16 @@ function exitViewMode() {
   document.getElementById('recordSection').classList.remove('hidden');
   document.getElementById('generateBtn').classList.remove('hidden');
   document.querySelector('.new-session-btn').classList.remove('hidden');
+  hideRetry();
+  setTranscribeStatus('');
 
   if (!viewSnapshot) return;
   const snap = viewSnapshot;
   viewSnapshot = null;
 
   transcript = snap.transcript;
-  document.getElementById('transcriptText').textContent = snap.transcript || '';
-  document.getElementById('transcriptPlaceholder').style.display = snap.transcript ? 'none' : '';
+  renderTranscript(snap.transcript || '');
+  if (!snap.transcript) setTranscriptPlaceholder('Transcript will appear here after the session ends.');
 
   snap.transcriptVisible
     ? document.getElementById('transcriptSection').classList.add('visible')
@@ -860,12 +1119,59 @@ function exitViewMode() {
   document.getElementById('recordLabel').textContent = snap.recordLabel;
 }
 
+// ── Legacy draft recovery ─────────────────────────────────────────────────────
+//
+// Nothing writes `scribe_draft` any more — the audio file is the recovery copy.
+// This only rescues a draft left behind by the previous (Web Speech) build.
+
+function maybeOfferRestore() {
+  let draft = null;
+  try { draft = JSON.parse(localStorage.getItem(DRAFT_KEY) || 'null'); } catch (e) { draft = null; }
+  if (!isDraftRestorable(draft)) return;
+  pendingDraft = draft;
+  const when = draft.savedAt ? new Date(draft.savedAt) : null;
+  document.getElementById('restoreBannerText').textContent =
+    'Recovered an unsaved transcript from the previous version' +
+    (when ? ', saved ' + when.toLocaleString() : '') + '. Restore it?';
+  document.getElementById('restoreBanner').classList.remove('hidden');
+}
+
+function restoreDraft() {
+  if (!pendingDraft) return;
+  transcript   = pendingDraft.transcript || '';
+  timerSeconds = pendingDraft.duration || 0;
+  currentSessionId = Date.now();
+  sessionStartISO  = pendingDraft.savedAt || new Date().toISOString();
+  pendingDraft = null;
+  persistSession();
+  try { localStorage.removeItem(DRAFT_KEY); } catch (e) {}
+
+  const m = String(Math.floor(timerSeconds / 60)).padStart(2, '0');
+  const s = String(timerSeconds % 60).padStart(2, '0');
+  document.getElementById('timer').textContent = m + ':' + s;
+  document.getElementById('timer').classList.add('visible');
+  renderTranscript(transcript);
+  document.getElementById('transcriptSection').classList.add('visible');
+  document.getElementById('generateBtn').classList.add('ready');
+  document.getElementById('recordLabel').textContent = 'Recovered — review, then Generate SOAP Note';
+  checkSafetyDoc();
+  diag('draft_restored');
+  hideRestore();
+}
+
+function discardDraft() {
+  pendingDraft = null;
+  try { localStorage.removeItem(DRAFT_KEY); } catch (e) {}
+  hideRestore();
+}
+
+function hideRestore() {
+  document.getElementById('restoreBanner').classList.add('hidden');
+}
+
 // ── Session reset ─────────────────────────────────────────────────────────────
 
 function newSession() {
-  // The session is already in history (persisted at stop / after generation).
-  // Restore the live state if we were viewing an old session, persist once more
-  // to capture any hand-edits to the SOAP fields, then reset the screen.
   exitViewMode();
   persistSession();
 
@@ -874,37 +1180,76 @@ function newSession() {
   timerSeconds = 0;
   currentSessionId = null;
   sessionStartISO  = null;
-  lastPersistedTranscript = null;
 
   document.getElementById('timer').textContent = '00:00';
   document.getElementById('timer').classList.remove('visible');
-  document.getElementById('transcriptText').textContent = '';
-  document.getElementById('transcriptPlaceholder').style.display = '';
   document.getElementById('transcriptSection').classList.remove('visible');
   document.getElementById('soapSection').classList.remove('visible');
   ['soapS', 'soapO', 'soapA', 'soapP'].forEach(id => document.getElementById(id).textContent = '');
   document.getElementById('cptRow').classList.remove('visible');
   document.getElementById('safetyWarning').classList.remove('visible');
   document.getElementById('generateBtn').classList.remove('ready');
+  document.getElementById('generateBtn').classList.remove('hidden');
   document.getElementById('recordBtn').disabled = false;
   document.getElementById('recordLabel').textContent = 'Tap to begin session';
   document.getElementById('statusDot').className = 'status-dot';
+  renderTranscript('');
+  setTranscriptPlaceholder('Transcript will appear here after the session ends.');
+  setTranscribeStatus('');
   hideError();
+  hideRetry();
+  pruneAudio();
 }
 
 // ── UI helpers ────────────────────────────────────────────────────────────────
+
+function renderTranscript(text) {
+  const box = document.getElementById('transcriptText');
+  box.textContent = text || '';
+  document.getElementById('transcriptPlaceholder').style.display = (text || '').trim() ? 'none' : '';
+}
+
+function setTranscriptPlaceholder(msg) {
+  const el = document.getElementById('transcriptPlaceholder');
+  el.textContent = msg;
+  el.style.display = document.getElementById('transcriptText').textContent.trim() ? 'none' : '';
+}
+
+function setTranscribeStatus(status) {
+  const el = document.getElementById('transcribeStatus');
+  const label = transcriptionLabel(status);
+  if (!label || status === 'completed') {
+    el.classList.remove('visible');
+    el.innerHTML = '';
+    return;
+  }
+  const spinner = (status === 'error') ? '' : '<span class="spinner sm"></span> ';
+  el.innerHTML = spinner + '<span>' + label + '</span>';
+  el.className = 'transcribe-status visible' + (status === 'error' ? ' err' : '');
+}
+
+function showRetry(sessionId) {
+  const btn = document.getElementById('retryBtn');
+  btn.classList.remove('hidden');
+  btn.onclick = () => retryTranscription(sessionId);
+}
+
+function hideRetry() {
+  document.getElementById('retryBtn').classList.add('hidden');
+}
 
 function showError(msg) {
   const el = document.getElementById('errorMsg');
   el.textContent = msg;
   el.classList.add('visible');
-  // Reveal the "Copy diagnostics" affordance only while an error is showing.
   const diagBtn = document.getElementById('copyDiagBtn');
   if (diagBtn) diagBtn.classList.remove('hidden');
 }
 
 function hideError() {
-  document.getElementById('errorMsg').classList.remove('visible');
+  const el = document.getElementById('errorMsg');
+  el.classList.remove('visible');
+  el.textContent = '';
   const diagBtn = document.getElementById('copyDiagBtn');
   if (diagBtn) diagBtn.classList.add('hidden');
 }

@@ -43,11 +43,35 @@
   <h2>Unit spec</h2>
   <ul class="results" id="results"></ul>
 
-  <h2>Safari stream simulation</h2>
+  <h2>Recording capability</h2>
   <div class="sub">
-    Feeds a fake recognition stream that mimics Safari's quirks — <em>duplicated</em> final
-    results plus a mid-session <em>restart</em> — through the real <code>buildTranscript</code>
-    used by the app, to prove the transcript comes out clean (no doubled text, nothing lost).
+    What this browser can actually do — and which audio container it will produce.
+    Safari and Chrome disagree here (Safari rejects every WebM type and records MP4/AAC),
+    so this reports what <code>pickAudioMime</code> negotiates against the real
+    <code>MediaRecorder</code>. No microphone permission is requested.
+  </div>
+  <div class="card">
+    <button onclick="runCaps()">Check capabilities</button>
+    <pre id="capsOut">Press “Check capabilities”.</pre>
+  </div>
+
+  <h2>Audio store round-trip</h2>
+  <div class="sub">
+    The crash-safety property, tested for real in this browser: write chunks to
+    <strong>IndexedDB</strong> exactly as a recording does, read them back, and confirm the
+    reassembled audio is byte-identical and correctly ordered. If this fails in Safari, a
+    recording would not survive a closed tab. Cleans up after itself.
+  </div>
+  <div class="card">
+    <button onclick="runStore()">Run round-trip</button>
+    <pre id="storeOut">Press “Run round-trip”.</pre>
+  </div>
+
+  <h2>Transcript assembly</h2>
+  <div class="sub">
+    Feeds a realistically-shaped AssemblyAI response — diarized <code>utterances</code>, a
+    split speaker turn, a blank segment — through the real <code>buildUtteranceTranscript</code>
+    the app uses, to prove the speaker-labeled transcript comes out clean.
   </div>
   <div class="card">
     <button onclick="runSim()">Run simulation</button>
@@ -63,7 +87,7 @@
       // Safari refuses to load ../helpers.js when this page is opened via
       // file:// (parent-directory access is blocked). Explain instead of
       // reporting every test as a cryptic "not a function" failure.
-      if (typeof window.buildTranscript !== 'function') {
+      if (typeof window.buildUtteranceTranscript !== 'function') {
         const summary = document.getElementById('summary');
         summary.className = 'fail';
         summary.textContent = 'helpers.js did not load — tests not run';
@@ -105,62 +129,155 @@
       summary.className = failed === 0 ? 'pass' : 'fail';
     })();
 
-    // ── FakeSpeechRecognition: a scripted, mic-free stand-in ────────────────────
-    // Mirrors the app's onresult/onend assembly (sessionBase + buildTranscript)
-    // so we exercise the true assembly path against a Safari-shaped event stream.
+    // ── Capability probe ────────────────────────────────────────────────────────
+    // Reports what this browser will actually do at record time. Runs the real
+    // pickAudioMime against the real MediaRecorder — no mic permission needed.
+    function runCaps() {
+      const supported = (t) => {
+        try { return typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(t); }
+        catch (e) { return false; }
+      };
+      const lines = [];
+      const yn = (v) => v ? 'yes' : 'NO';
+
+      lines.push('getUserMedia:   ' + yn(!!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)));
+      lines.push('MediaRecorder:  ' + yn(typeof MediaRecorder !== 'undefined'));
+      lines.push('IndexedDB:      ' + yn(typeof indexedDB !== 'undefined'));
+      lines.push('AudioContext:   ' + yn(!!(window.AudioContext || window.webkitAudioContext)));
+      lines.push('');
+      lines.push('Per-container support:');
+      AUDIO_MIME_CANDIDATES.forEach(m => lines.push('  ' + (supported(m) ? '✔' : '·') + ' ' + m));
+      const chosen = pickAudioMime(supported);
+      lines.push('');
+      lines.push('Negotiated:     ' + (chosen || '(browser default)'));
+
+      const fatal = !(navigator.mediaDevices && navigator.mediaDevices.getUserMedia) ||
+                    typeof MediaRecorder === 'undefined' ||
+                    typeof indexedDB === 'undefined';
+      lines.push('');
+      lines.push('RESULT: ' + (fatal
+        ? '❌ this browser cannot run the app — recording or storage is missing'
+        : '✅ this browser can record and persist audio'));
+
+      document.getElementById('capsOut').textContent = lines.join('\n');
+    }
+
+    // ── Audio store round-trip ──────────────────────────────────────────────────
+    // Exercises the same IndexedDB shape app.js uses ([sessionId, seq] keyPath +
+    // a bySession index), because "does a Blob survive IndexedDB in Safari" is
+    // exactly the kind of thing that cannot be proven in Node.
+    function runStore() {
+      const out = document.getElementById('storeOut');
+      out.textContent = 'Running…';
+      const DB = 'scribe_audio_harness';
+      const STORE = 'chunks';
+      const sid = Date.now();
+      // Deliberately written out of order to prove the reader sorts by seq.
+      const parts = [[2, 'third-'], [0, 'first-'], [1, 'second-']];
+      const expected = 'first-second-third-';
+
+      const open = () => new Promise((resolve, reject) => {
+        const req = indexedDB.open(DB, 1);
+        req.onupgradeneeded = () => {
+          const db = req.result;
+          if (!db.objectStoreNames.contains(STORE)) {
+            const store = db.createObjectStore(STORE, { keyPath: ['sessionId', 'seq'] });
+            store.createIndex('bySession', 'sessionId', { unique: false });
+          }
+        };
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+      });
+
+      open().then(db => {
+        return new Promise((resolve, reject) => {
+          const tx = db.transaction(STORE, 'readwrite');
+          const store = tx.objectStore(STORE);
+          parts.forEach(([seq, text]) =>
+            store.put({ sessionId: sid, seq, blob: new Blob([text], { type: 'text/plain' }), mime: 'text/plain' }));
+          tx.oncomplete = () => resolve(db);
+          tx.onerror = () => reject(tx.error);
+        });
+      }).then(db => {
+        return new Promise((resolve, reject) => {
+          const tx = db.transaction(STORE, 'readonly');
+          const req = tx.objectStore(STORE).index('bySession').getAll(sid);
+          req.onsuccess = () => resolve({ db, rows: req.result || [] });
+          req.onerror = () => reject(req.error);
+        });
+      }).then(({ db, rows }) => {
+        const sorted = rows.slice().sort((a, b) => a.seq - b.seq);
+        const blob = new Blob(sorted.map(r => r.blob), { type: 'text/plain' });
+        return new Response(blob).text().then(text => ({ db, rows, text, blob }));
+      }).then(({ db, rows, text, blob }) => {
+        // Clean up so repeated runs do not accumulate.
+        const tx = db.transaction(STORE, 'readwrite');
+        const store = tx.objectStore(STORE);
+        const keys = store.index('bySession').getAllKeys(sid);
+        keys.onsuccess = () => (keys.result || []).forEach(k => store.delete(k));
+        tx.oncomplete = () => { db.close(); indexedDB.deleteDatabase(DB); };
+
+        const ok = text === expected && rows.length === parts.length;
+        out.textContent =
+          'Chunks written:    ' + parts.length + ' (out of order: 2, 0, 1)\n' +
+          'Chunks read back:  ' + rows.length + '\n' +
+          'Reassembled bytes: ' + blob.size + '\n' +
+          'Reassembled text:  "' + text + '"\n' +
+          'Expected:          "' + expected + '"\n\n' +
+          'RESULT: ' + (ok
+            ? '✅ audio survives IndexedDB and reassembles in order'
+            : '❌ round-trip failed — a recording would NOT survive a closed tab');
+      }).catch(err => {
+        out.textContent = 'RESULT: ❌ IndexedDB error — ' + ((err && err.message) || err) +
+          '\n\nA recording would not survive a closed tab in this browser.' +
+          '\n(Private Browsing blocks IndexedDB in Safari — check that first.)';
+      });
+    }
+
+    // ── Transcript assembly ─────────────────────────────────────────────────────
+    // A realistically-shaped AssemblyAI payload through the real assembly path.
     function runSim() {
-      // A growing results list, as the Web Speech API delivers it, but with
-      // Safari's duplicate-final and a restart (list resets, base carries over).
-      const streamSession1 = [
-        [{ transcript: 'patient reports low mood', isFinal: true }],
-        [{ transcript: 'patient reports low mood', isFinal: true },
-         { transcript: 'and poor sleep', isFinal: true }],
-        // Safari re-emits the same final again — must not double up:
-        [{ transcript: 'patient reports low mood', isFinal: true },
-         { transcript: 'and poor sleep', isFinal: true },
-         { transcript: 'and poor sleep', isFinal: true }],
-        [{ transcript: 'patient reports low mood', isFinal: true },
-         { transcript: 'and poor sleep', isFinal: true },
-         { transcript: 'and poor sleep', isFinal: true },
-         { transcript: 'over the past', isFinal: false }], // live interim
-      ];
+      // Shaped like a real /v2/transcript response: anonymous speaker ids, one
+      // speaker turn split across two utterances, and a blank segment.
+      const response = {
+        status: 'completed',
+        audio_duration: 2640,
+        confidence: 0.981,
+        text: 'How have you been sleeping? About four hours a night. It has been like that for three weeks. Any thoughts of harming yourself? No, nothing like that.',
+        utterances: [
+          { speaker: 'A', text: 'How have you been sleeping?' },
+          { speaker: 'B', text: 'About four hours a night.' },
+          { speaker: 'B', text: 'It has been like that for three weeks.' },  // same speaker → merges
+          { speaker: 'A', text: '   ' },                                     // blank → dropped
+          { speaker: 'A', text: 'Any thoughts of harming yourself?' },
+          { speaker: 'B', text: 'No, nothing like that.' },
+        ],
+      };
 
-      let base = '';
-      let lastFinal = '';
-      let transcript = '';
+      const actual = buildUtteranceTranscript(response.utterances, response.text);
+      const expected = [
+        'Speaker A: How have you been sleeping?',
+        'Speaker B: About four hours a night. It has been like that for three weeks.',
+        'Speaker A: Any thoughts of harming yourself?',
+        'Speaker B: No, nothing like that.',
+      ].join('\n');
 
-      // Session 1
-      for (const results of streamSession1) {
-        const out = buildTranscript(base, results);
-        transcript = out.text;
-        lastFinal = out.final;
-      }
-      // …onend fires → restart: finalized text becomes the new base
-      base = lastFinal;
+      // The fallback path matters just as much: diarization can come back empty.
+      const fallback = buildUtteranceTranscript([], response.text);
 
-      // Session 2 (fresh results list, as after a Safari restart)
-      const streamSession2 = [
-        [{ transcript: 'two weeks', isFinal: true }],
-        [{ transcript: 'two weeks', isFinal: true },
-         { transcript: 'denies SI', isFinal: true }],
-      ];
-      for (const results of streamSession2) {
-        const out = buildTranscript(base, results);
-        transcript = out.text;
-      }
-
-      const expected = 'patient reports low mood and poor sleep two weeks denies SI';
-      const actual = transcript.trim();
-      const doubled = /and poor sleep\s+and poor sleep/.test(actual);
-      const ok = actual === expected && !doubled;
+      const ok = actual === expected && fallback === response.text;
+      const mins = Math.round(response.audio_duration / 60);
 
       document.getElementById('simOut').textContent =
-        'Assembled transcript:\n  "' + actual + '"\n\n' +
-        'Expected:\n  "' + expected + '"\n\n' +
-        'Doubled text present? ' + (doubled ? 'YES (bug!)' : 'no') + '\n' +
-        'SI/HI documented?     ' + (hasSafetyDoc(actual) ? 'yes' : 'no') + '\n\n' +
-        'RESULT: ' + (ok ? '✅ clean — dedupe + restart-carry both work'
-                         : '❌ mismatch — check buildTranscript');
+        'Assembled transcript:\n' + actual + '\n\n' +
+        'Matches expected?      ' + (actual === expected ? 'yes' : 'NO') + '\n' +
+        'Empty-diarization\n' +
+        '  falls back to text?  ' + (fallback === response.text ? 'yes' : 'NO') + '\n' +
+        'SI/HI documented?      ' + (hasSafetyDoc(actual) ? 'yes' : 'no') + '\n' +
+        'Billed duration:       ' + mins + ' min → ' + formatUsd(estimateCost(response.audio_duration)) + '\n' +
+        'CPT for this length:   ' + selectCPT(response.audio_duration).map(p => p[0]).join(', ') + '\n\n' +
+        'RESULT: ' + (ok ? '✅ clean — speaker turns merged, blanks dropped, fallback works'
+                         : '❌ mismatch — check buildUtteranceTranscript');
     }
   </script>
 </body>
