@@ -28,23 +28,39 @@
         <div class="wordmark-title">Scribe</div>
         <div class="wordmark-sub">West County Physicians</div>
       </div>
-      <div class="status-dot" id="statusDot"></div>
+      <div class="header-right">
+        <button class="settings-btn" onclick="showSettings()" title="API keys">Keys</button>
+        <div class="status-dot" id="statusDot"></div>
+      </div>
     </header>
 
-    <!-- API key setup (shown on first visit) -->
-    <div class="setup-card" id="setupCard">
-      <div class="setup-title">Enter your API key</div>
-      <div class="setup-desc">Your key is stored only in this browser and never sent anywhere except the Anthropic API.</div>
-      <div class="key-row">
-        <input class="key-input" type="password" id="apiKeyInput" placeholder="sk-ant-api03-..." />
-        <button class="key-save-btn" onclick="saveKey()">Save</button>
+    <!-- API key setup (shown on first visit, and via the Keys button) -->
+    <div class="setup-card hidden" id="setupCard">
+      <div class="setup-title">API keys</div>
+      <div class="setup-desc">
+        Both keys are stored only in this browser. Audio goes to AssemblyAI for transcription;
+        the transcript goes to Anthropic to write the note.
       </div>
+      <div class="key-field">
+        <label class="key-label" for="assemblyKeyInput">AssemblyAI — transcription</label>
+        <div class="key-row">
+          <input class="key-input" type="password" id="assemblyKeyInput" placeholder="32-character key from assemblyai.com/app" />
+        </div>
+      </div>
+      <div class="key-field">
+        <label class="key-label" for="apiKeyInput">Anthropic — SOAP note</label>
+        <div class="key-row">
+          <input class="key-input" type="password" id="apiKeyInput" placeholder="sk-ant-api03-..." />
+        </div>
+      </div>
+      <div class="setup-error" id="setupError"></div>
+      <button class="key-save-btn" onclick="saveKeys()">Save keys</button>
     </div>
 
     <!-- Main interface (hidden until key is saved) -->
     <div id="mainInterface" class="hidden">
 
-      <!-- Crash-recovery banner (shown when an unsaved transcript is found) -->
+      <!-- Legacy crash-recovery banner (a draft left by the previous version) -->
       <div class="restore-banner hidden" id="restoreBanner">
         <span id="restoreBannerText">Recovered an unsaved transcript. Restore it?</span>
         <div class="restore-banner-actions">
@@ -52,6 +68,17 @@
           <button class="restore-btn ghost" onclick="discardDraft()">Discard</button>
         </div>
       </div>
+
+      <!-- Recorded sessions still owing a transcript -->
+      <div class="restore-banner hidden" id="pendingBanner" data-ids="">
+        <span id="pendingBannerText">A recorded session has no transcript yet.</span>
+        <div class="restore-banner-actions">
+          <button class="restore-btn" onclick="transcribePending()">Transcribe now</button>
+        </div>
+      </div>
+
+      <!-- Estimated AssemblyAI credit remaining -->
+      <div class="credit-meter hidden" id="creditMeter"></div>
 
       <!-- Viewing-history banner -->
       <div class="viewing-banner hidden" id="viewingBanner">
@@ -87,15 +114,16 @@
         <div class="record-label" id="recordLabel">Tap to begin session</div>
       </div>
 
-      <!-- Live transcript -->
+      <!-- Transcript -->
       <div class="transcript-section" id="transcriptSection">
-        <div class="section-label">Live transcript</div>
+        <div class="section-label">Transcript</div>
+        <div class="transcribe-status" id="transcribeStatus"></div>
         <div class="transcript-box" id="transcriptBox">
-          <span class="transcript-placeholder" id="transcriptPlaceholder">Transcript will appear here as the patient speaks...</span>
+          <span class="transcript-placeholder" id="transcriptPlaceholder">Transcript will appear here after the session ends.</span>
           <span id="transcriptText"></span>
-          <span class="cursor hidden" id="transcriptCursor"></span>
         </div>
         <div class="error-msg" id="errorMsg"></div>
+        <button class="retry-btn hidden" id="retryBtn">Transcribe from saved audio</button>
         <button class="diag-btn hidden" id="copyDiagBtn" onclick="copyDiagnostics()">Copy diagnostics</button>
         <div class="safety-warning" id="safetyWarning">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="flex-shrink:0">

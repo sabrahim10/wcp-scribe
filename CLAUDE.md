@@ -1,6 +1,6 @@
 # Scribe — West County Physicians
 
-AI-powered medical scribe web app. Single HTML file hosted on GitHub Pages. Records patient sessions via browser speech recognition, transcribes in real time, and generates structured SOAP notes via the Anthropic API.
+AI-powered medical scribe web app. Static site hosted on GitHub Pages. Records patient sessions to disk, transcribes them with AssemblyAI after the session ends, and generates structured SOAP notes via the Anthropic API.
 
 ## Project Structure
 
@@ -8,7 +8,7 @@ AI-powered medical scribe web app. Single HTML file hosted on GitHub Pages. Reco
 wcp-scribe/
 ├── index.html          # App markup — UI structure
 ├── helpers.js          # Pure, DOM-free logic (loaded before app.js; shared with tests)
-├── app.js              # Recording, auto-save, diagnostics, SOAP API call, UI wiring
+├── app.js              # Recording, audio store, transcription, SOAP API call, UI wiring
 ├── styles.css          # All styling + animations
 ├── package.json        # Dev-only: `npm test` (the app itself has no build step)
 ├── tests/
@@ -20,49 +20,74 @@ wcp-scribe/
 └── README.md           # Optional
 ```
 
-**Architecture note:** pure logic (transcript assembly, CPT, SOAP parsing, draft
-serialization, error mapping, diagnostics formatting) lives in `helpers.js` with no
-DOM/browser access, so the *identical* code is tested in Node and in a real browser.
-`app.js` holds the DOM wiring and side-effecting code and depends on those globals.
+**Architecture note:** pure logic (audio-format negotiation, speaker-labeled
+transcript assembly, CPT, SOAP parsing, error mapping, retention policy, spend
+estimation, diagnostics formatting) lives in `helpers.js` with no DOM/browser
+access, so the *identical* code is tested in Node and in a real browser. `app.js`
+holds the DOM wiring and side-effecting code and depends on those globals.
 
 ## What This App Does
 
-1. Physician opens the URL on their work laptop in Chrome
-2. On first use, pastes Anthropic API key (stored in localStorage, persists across sessions)
-3. Hits the record button — browser Web Speech API transcribes speech in real time
-4. Hits stop when session ends
-5. Clicks "Generate SOAP Note" — transcript is sent to Claude API
-6. Structured S/O/A/P note appears, ready to copy into EHR
+1. Physician opens the URL on their laptop (Safari, Chrome, or Edge)
+2. On first use, pastes two API keys — AssemblyAI and Anthropic (both in localStorage)
+3. Hits the record button — audio is captured and written to IndexedDB in 5s chunks
+4. Hits stop when the session ends
+5. The audio uploads to AssemblyAI automatically; a speaker-labeled transcript returns
+6. Clicks "Generate SOAP Note" — transcript is sent to Claude API
+7. Structured S/O/A/P note appears, ready to copy into EHR
 
 ## Tech Stack
 
 - **Frontend:** Vanilla HTML/CSS/JS — no build step, no framework, no dependencies
-- **Speech:** Web Speech API (built into Chrome/Edge — no external service)
-- **AI:** Anthropic Claude API (`claude-sonnet-4-6`) via direct browser fetch
+- **Capture:** `MediaRecorder` → IndexedDB (`scribe_audio` database, `chunks` store)
+- **Speech:** AssemblyAI `universal-3-5-pro`, `domain: medical-v1`, speaker diarization
+- **AI:** Anthropic Claude API (`claude-opus-5`) via direct browser fetch
 - **Hosting:** GitHub Pages (static, free)
 - **Auth:** None — security through private repo + obscure URL + localStorage key storage
 
+## Why There Is No Backend
+
+Both APIs are reachable from the browser directly: AssemblyAI returns
+`access-control-allow-origin: *` with `Authorization` permitted on `/v2/upload`
+and `/v2/transcript`, and Anthropic allows it via the
+`anthropic-dangerous-direct-browser-access` header. That is what keeps this a
+static site with no build step. If a proxy is ever added, it should be for **key
+custody**, not for CORS.
+
 ## API Key Handling
 
-The Anthropic API key is entered by the user on first load and stored in `localStorage` under the key `scribe_key`. It persists until the user clears browser storage. It is sent directly from the browser to `api.anthropic.com` over HTTPS.
+Two keys, both entered on first load and stored in `localStorage`:
 
-**This is acceptable for personal/internal use on a private work laptop.** For a production multi-user deployment, replace with a Vercel serverless proxy so the key never touches the client.
+| Key | Storage key | Sent to |
+|---|---|---|
+| AssemblyAI (transcription) | `scribe_assembly_key` | `api.assemblyai.com` |
+| Anthropic (SOAP note) | `scribe_key` | `api.anthropic.com` |
+
+Both persist until browser storage is cleared, and can be re-entered at any time
+via the **Keys** button in the header.
+
+**This is acceptable for personal/internal use on a private laptop.** For a
+production multi-user deployment, replace with a serverless proxy so neither key
+touches the client.
 
 ## Claude API Call
 
-- **Model:** `claude-sonnet-4-6`
-- **Max tokens:** 4000 (raised from 1500 so long intake notes don't truncate mid-JSON)
-- **Input:** Raw transcript text
+- **Model:** `claude-opus-5`
+- **Max tokens:** 8000
+- **Input:** Speaker-labeled transcript (`Speaker A:` / `Speaker B:` lines)
 - **Output:** JSON object with keys `S`, `O`, `A`, `P`
-- **Prompt role:** Psychiatric scribe — uses proper psychiatric terminology, only uses information present in the transcript
+- **Prompt role:** Psychiatric scribe. Told to infer which anonymous speaker is the
+  clinician vs. the patient and attribute accordingly, and to write a garbled
+  medication name as heard rather than guessing a plausible substitute.
 
 ## Key Constraints
 
-- Must work as a **single HTML file** — no build process, no npm, no bundler
-- Must work in **Chrome on desktop** (Web Speech API requirement)
+- Must work as a **static site** — no build process, no npm at runtime, no bundler
+- Must work in **Safari on macOS** (the physician's actual browser), and Chrome/Edge
 - No backend — everything runs in the browser
 - No patient names should be used in sessions (HIPAA best practice)
 - Keep the GitHub repo **private**
+- **Audio is never deleted while it is the only copy of a session** (see Tier 2)
 
 ## Tier 1 Reliability & Performance (done — June 2026)
 
@@ -143,56 +168,76 @@ when "New Session" was clicked. The save lifecycle is now:
 - [x] **Fixed silent discard** — clicking "New Session" while viewing a past
   session used to skip saving and wipe the unsaved live transcript.
 
-## Recognition lifecycle & reconnect behavior (how it actually runs)
+## Tier 2 — Real transcription, and the end of missed notes (done — August 2026)
 
-Field testing on Safari established these behaviors — read this before touching the
-recording loop in `app.js`:
+Tiers 1/1b/1c all protected the transcript *after* speech recognition produced it.
+But the Web Speech API was a live, one-shot, unrecoverable pipeline: **no audio was
+ever stored**, so anything recognition failed to hear was gone with no retry path —
+the ~5s no-speech kill, the restart gap, the backgrounded-tab mic suspend. Tier 2
+removes the entire class of problem by recording the audio first.
 
-- **Restart is driven by recognition *liveness*, not silence.** `makeRecognition()`
-  wires `onstart`/`onresult`/`onend`; `recogRunning`/`starting` track whether a
-  session is live. `onend` restarts via `scheduleRestart()`; `tryStartRecognition()`
-  starts with try/catch, and on a thrown/blocked start it backs off exponentially
-  (`RESTART_MIN_MS`→`RESTART_MAX_MS`) and recreates the recognizer. It never
-  silently gives up while `isRecording` is true.
-- **Do NOT stop() on silence.** An earlier watchdog force-stopped every ~12s of
-  silence; that triggered Safari's rapid-restart abuse block (`not-allowed`) and was
-  the cause of mid-session death. The watchdog now only acts when capture is truly
-  down (`!recogRunning`) or a session is a "zombie" (running but silent > `ZOMBIE_MS`).
-- **Safari's ~5s no-speech timeout is unavoidable.** During pure silence Safari ends
-  the session (~5s) and macOS plays a beep — we cannot lengthen that window. We only
-  space out restarts during silence (`RESTART_SILENCE_MS`, ~2.5s) vs. fast restarts
-  mid-conversation (`RESTART_MIN_MS`) so it doesn't churn/beep constantly. Tune
-  `RESTART_SILENCE_MS` up to reduce beeps (trade-off: may clip the first word after
-  a long silence).
-- **Honest status via `setCapturing()`** — before any speech, quiet cycling shows a
-  calm "Listening…" (red dot); a *lost* established stream shows amber "Reconnecting…"
-  (`status-dot.reconnecting`). The timer/waveform run on their own and must never be
-  read as proof that capture is alive.
-- **Backgrounding suspends the mic (OS-level, unfixable).** When the Safari tab is
-  hidden (e.g. swiping to a full-screen app on another Space) macOS suspends the mic
-  and recognition drops after ~5s. The `visibilitychange` handler resumes capture
-  immediately on return. Foreground use (the physician's normal case) stays live
-  indefinitely. Tier 2 (below) is the only way around the backgrounded case.
-- **Error banners** — only shown for a *persistent* failure (`!hasResult &&
-  restartCount >= 2`), and auto-cleared the moment a result arrives, so a transient
-  Safari `not-allowed` at startup no longer leaves a stale "blocked" banner.
+**The invariant:** audio reaches IndexedDB *before* anything else is attempted, so
+every downstream failure (no credits, no network, bad key, closed tab, AssemblyAI
+outage) delays a note instead of losing one.
+
+- [x] **`MediaRecorder` → IndexedDB, every 5 seconds.** `scribe_audio` DB, `chunks`
+  store, keyed `[sessionId, seq]` with a `bySession` index — each flush is a small
+  write, not a rewrite of the growing recording. localStorage cannot hold audio.
+- [x] **Web Speech API deleted entirely.** With it went the beeps, the restart churn,
+  the fan load, the duplicate-final dedupe, the zombie watchdog, and Apple's servers.
+  `buildTranscript`, `friendlyRecognitionError`, `isTransientRecognitionError`, and
+  `serializeDraft` are gone from `helpers.js`.
+- [x] **Backgrounding no longer breaks anything.** `MediaRecorder` is not suspended
+  the way `SpeechRecognition` was, so she can switch apps or Spaces mid-session. This
+  was previously documented as OS-level and unfixable; it is fixed by not using
+  speech recognition.
+- [x] **Honest level meter.** The 12 bars are driven by an `AnalyserNode` on the
+  *same* MediaStream being written to disk, so movement is real proof of capture.
+  Compositor-only (`transform: scaleY`), gated to ~12fps, and skipped entirely under
+  `prefers-reduced-motion` — cheaper than the Tier 1 CSS waveform it replaced, and
+  unlike that waveform it cannot animate while the mic is dead.
+- [x] **Speaker diarization** (`speaker_labels: true`) → the transcript is built as
+  `Speaker A:` / `Speaker B:` turns by `buildUtteranceTranscript`, with consecutive
+  turns merged. Claude is told to infer which is the clinician.
+- [x] **Medical Mode** (`domain: 'medical-v1'`) — normalizes dosages into clinical
+  notation ("sertraline fifty milligrams" → `sertraline 50 mg`) and cuts missed
+  clinical entities. Costs $0.15/hr on top of the $0.21/hr base.
+- [x] **Resumable transcription.** Session state (`transcriptionStatus`, `assemblyId`)
+  is written to history at every step. On load, `resumeUnfinishedWork()` re-polls
+  jobs already submitted (the result is waiting server-side and already paid for) and
+  offers a banner for sessions whose audio never got uploaded.
+- [x] **Every failure is retryable.** Sidebar flags the session `Needs transcript`;
+  opening it offers **Transcribe from saved audio**. `assemblyErrorMessage()` maps
+  each failure to a specific action, and every message ends by saying the audio is safe.
+- [x] **Spend estimate.** Cumulative `audio_duration` is tallied in `scribe_usage`;
+  the header meter reports estimated credit left and warns below $5, so credits
+  running out is visible in advance rather than as a mid-week failure.
+
+### Audio retention rule (`selectAudioToPrune`) — read before changing
+
+Recordings are large, so they cannot accumulate forever. Audio is dropped **only**
+when the session both (a) already has a finished note and (b) has fallen outside the
+10 most recent entries. A session still owing a transcript or a note keeps its audio
+no matter how old it is, because that audio is the only copy. There is a test named
+"NEVER drops audio for a session without a note" guarding exactly this — if it goes
+red, the safety property is broken.
 
 ## Potential Improvements (Future)
 
-- [ ] Vercel proxy to move API key server-side
-- [ ] Anthropic BAA for HIPAA compliance
-- [ ] **HIPAA note (Safari):** Safari's Web Speech API sends session audio to
-  **Apple's servers** for transcription — a PHI disclosure not covered by an
-  Anthropic BAA. Chrome/Edge behave similarly. A self-hosted/on-device STT (Tier 2)
-  would remove this. Worth reviewing before any non-personal/production use.
+- [ ] Serverless proxy to move both API keys server-side
+- [ ] BAA with AssemblyAI + Anthropic if this ever goes beyond personal use.
+  **Deliberately skipped for now** (owner's decision, Aug 2026). Note that Tier 2
+  *reduced* exposure: Apple's servers are no longer in the path at all, leaving
+  AssemblyAI and Anthropic as the only third parties.
 - [x] Patient session history (localStorage)
 - [ ] Export to PDF
 - [ ] Specialty-specific SOAP templates (psychiatry vs general)
-- [ ] Speaker diarization (separate physician vs patient speech)
-- [x] Auto-save transcript in case of accidental tab close / timeout
-- [ ] **Tier 2 (if Safari still flaky):** capture audio via `MediaRecorder` and
-  stream to a real STT service (Whisper/Deepgram) instead of the Web Speech API —
-  browser-agnostic and robust for hour-long sessions, but adds cost + a BAA need.
+- [x] Speaker diarization (separate physician vs patient speech)
+- [x] Audio survives accidental tab close / crash / timeout
+- [ ] `hasSafetyDoc` misses the phrasing "harming yourself" / "hurt yourself", so a
+  session where SI *was* screened can still raise the "SI/HI not documented" warning.
+  Adding those terms to `SAFETY_TERMS` would cut false alarms — left alone for now
+  because it is a clinical-safety heuristic and should be a deliberate change.
 
 ## SOAP Note Prompt
 
@@ -215,28 +260,59 @@ python3 -m http.server 8000  # then open http://localhost:8000/tests/harness.htm
 
 The harness must be served over HTTP for Safari — opened via file:// Safari blocks
 the `../helpers.js` load (parent-directory access) and every helper comes up
-undefined; Chrome tolerates it, which can mask the problem. The harness now shows
-an explanatory banner instead of 31 bogus failures when this happens.
+undefined; Chrome tolerates it, which can mask the problem. The harness shows an
+explanatory banner instead of a screen of bogus failures when this happens.
 
-Coverage: transcript assembly + Safari duplicate-final dedupe (`buildTranscript`),
-CPT selection, SI/HI detection, SOAP JSON parsing (fences/prose/truncation repair),
-draft serialization/recovery, session history upsert (`upsertSession`), and
-error-code → message mapping.
+Coverage (63 cases): audio-format negotiation (`pickAudioMime`, with Chrome- and
+Safari-shaped detectors), mic error mapping, speaker-labeled transcript assembly
+(`buildUtteranceTranscript`), transcription error mapping, session-state predicates,
+**the audio retention rule** (`selectAudioToPrune`), spend estimation, key-shape
+checks, CPT selection, SI/HI detection, SOAP JSON parsing (fences/prose/truncation
+repair), session history upsert, and diagnostics formatting.
 
-For anything involving the mic, Apple's speech servers, or the fan, run
+The harness additionally has three interactive checks that only mean anything in a
+real browser, and are the reason to run it in Safari specifically:
+
+1. **Check capabilities** — what this browser supports, and which container
+   `pickAudioMime` negotiates against the real `MediaRecorder` (Safari: MP4/AAC;
+   Chrome: WebM/Opus).
+2. **Run round-trip** — writes chunks to IndexedDB out of order, reads them back,
+   and proves the audio reassembles byte-identical and correctly ordered. **This is
+   the crash-safety property.** If it fails, a recording would not survive a closed
+   tab. (Safari Private Browsing blocks IndexedDB — that will show up here.)
+3. **Run simulation** — a realistic AssemblyAI payload through the real assembly path.
+
+For anything involving the mic, a real upload, or the fan, run
 `tests/SAFARI_CHECKLIST.md` on the actual MacBook — automated tests can't cover those.
+Its §6 (failure-path test) is the one that verifies the core Tier 2 promise: a bad
+key or dead network delays a note rather than losing one.
 
 Run `npm test` (green) **and** at least the harness in Safari before pushing. The app
 stays a dependency-free static site; `package.json` exists only for the test command.
 
 ## Common Issues
 
-**Speech recognition not working:** Best in Chrome or Edge. Safari's Web Speech API
-works but is less reliable on long sessions — the app now hardens against this with
-a restart watchdog and auto-save (see Tier 1 above). Microphone permission must be granted.
+**No sound reaching the mic:** The level meter stays flat and, after 20 seconds, a
+banner points at System Settings ▸ Sound ▸ Input. Almost always the wrong input
+device. The recording keeps running regardless.
 
-**API key error:** Key must start with `sk-ant-`. If getting 401, the key may be invalid or expired. Clear localStorage and re-enter.
+**Transcription failed:** Read the message — it names the cause (credits, key, rate
+limit, server, offline) and the fix. **The audio is always still on disk**; open the
+session from the sidebar and click *Transcribe from saved audio*. Nothing is lost.
 
-**SOAP note parsing error:** Claude returned malformed JSON. Retry — this is rare but can happen. If persistent, check the raw transcript for unusual characters.
+**Credits ran out:** AssemblyAI pauses API access at $0 rather than auto-charging.
+Top up at assemblyai.com/app, then retry the affected sessions from the sidebar. The
+header meter warns below $5 so this should never be a surprise.
 
-**Recognition stops mid-session:** Web Speech API has a timeout on silence. If the patient pauses for more than ~60 seconds, recognition may stop. The stop/start button resets it.
+**Anthropic API key error:** Key must start with `sk-ant-`. On a 401 the key may be
+invalid or expired — re-enter via the **Keys** button.
+
+**SOAP note parsing error:** Claude returned malformed JSON. Retry — rare, and
+`repairTruncatedJSON` salvages most truncations. The transcript is already saved.
+
+**Nothing survived a crash:** Check that Safari is not in Private Browsing, which
+blocks IndexedDB. The harness round-trip test (§1 of the checklist) detects this.
+
+**Storage full:** IndexedDB writes fail and a warning appears mid-recording. Old
+audio is pruned automatically (see the retention rule), but a very full disk can
+still bite. Audio runs ~64 kbps, so roughly 21 MB per hour of session.

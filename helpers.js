@@ -31,32 +31,212 @@ function selectCPT(seconds) {
   return [['90837', '60 min therapy'], ['99215', 'Med management']];
 }
 
-// Transcript assembly -----------------------------------------------------------
+// Audio capture -----------------------------------------------------------------
 //
-// Rebuilds the transcript from the recognition result list every event, rather
-// than blindly appending. This fixes Safari's habit of re-emitting/duplicating
-// final results (which would otherwise double up the text). `base` carries text
-// finalized in earlier recognition sessions across the restart loop.
-//   results: array of { transcript, isFinal }
-// Returns { text, final } — `text` includes live interim words; `final` is the
-// stable portion to carry into `base` on the next restart.
-function buildTranscript(base, results) {
-  let final = '';
-  let interim = '';
-  let prevFinal = null;
-  for (const r of (results || [])) {
-    const t = r.transcript || '';
-    if (r.isFinal) {
-      const trimmed = t.trim();
-      if (trimmed && trimmed === prevFinal) continue; // drop Safari re-emit
-      prevFinal = trimmed;
-      final += t.trim() + ' ';
+// MediaRecorder container support is browser-specific and there is no single
+// format both engines take: Chrome/Edge produce WebM/Opus, Safari produces
+// MP4/AAC and returns false for every WebM type. Opus is preferred where it
+// exists (roughly half the bytes for speech), so the list is ordered by
+// preference and the first supported entry wins. An empty string means "let the
+// browser pick its own default", which is still a valid MediaRecorder config.
+const AUDIO_MIME_CANDIDATES = [
+  'audio/webm;codecs=opus',
+  'audio/webm',
+  'audio/mp4;codecs=mp4a.40.2',
+  'audio/mp4',
+  'audio/ogg;codecs=opus',
+];
+
+function pickAudioMime(isTypeSupported) {
+  if (typeof isTypeSupported !== 'function') return '';
+  for (const mime of AUDIO_MIME_CANDIDATES) {
+    let ok = false;
+    try { ok = !!isTypeSupported(mime); } catch (e) { ok = false; }
+    if (ok) return mime;
+  }
+  return '';
+}
+
+// Human-readable messages for getUserMedia failures ------------------------------
+//
+// Replaces the old SpeechRecognition error mapping — the failures that matter
+// now are microphone-permission and device problems, not speech-service ones.
+function micErrorMessage(name) {
+  switch (name) {
+    case 'NotAllowedError':
+    case 'PermissionDeniedError':
+    case 'SecurityError':
+      return 'Microphone access was blocked. Allow the microphone for this site (Safari ▸ Settings for This Website ▸ Microphone), then try again.';
+    case 'NotFoundError':
+    case 'DevicesNotFoundError':
+      return 'No microphone was found. Check that the mic is connected and selected in System Settings ▸ Sound ▸ Input.';
+    case 'NotReadableError':
+    case 'TrackStartError':
+      return 'The microphone is being used by another app. Quit anything else using it (Zoom, FaceTime, Teams), then try again.';
+    case 'OverconstrainedError':
+      return 'The selected microphone could not be used. Pick a different input in System Settings ▸ Sound ▸ Input, then try again.';
+    default:
+      return 'Could not start the microphone: ' + (name || 'unknown error');
+  }
+}
+
+// Transcription — speaker-labeled transcript assembly ----------------------------
+//
+// AssemblyAI returns both a flat `text` and a list of diarized `utterances`
+// ({ speaker: 'A', text: '...' }). The labeled form is what gets sent to Claude:
+// knowing who said what is what lets the note separate the patient's report from
+// the clinician's observations instead of guessing. Consecutive turns by the same
+// speaker are merged so one person's paragraph stays one paragraph. Falls back to
+// the flat text whenever diarization returned nothing usable.
+function buildUtteranceTranscript(utterances, fallbackText) {
+  const list = Array.isArray(utterances) ? utterances : [];
+  const lines = [];
+  let prevSpeaker = null;
+  for (const u of list) {
+    const text = String((u && u.text) || '').trim();
+    if (!text) continue;
+    const speaker = (u && u.speaker != null) ? String(u.speaker) : '?';
+    if (speaker === prevSpeaker && lines.length) {
+      lines[lines.length - 1] += ' ' + text;
     } else {
-      interim += t;
+      lines.push('Speaker ' + speaker + ': ' + text);
+      prevSpeaker = speaker;
     }
   }
-  const baseStr = base || '';
-  return { text: (baseStr + final + interim), final: (baseStr + final) };
+  return lines.length ? lines.join('\n') : String(fallbackText || '').trim();
+}
+
+// Transcription — error mapping --------------------------------------------------
+//
+// Every message ends by saying the audio is safe, because it always is: the
+// recording is written to IndexedDB before any upload is attempted, so a failure
+// here delays a note, it never loses one.
+function assemblyErrorMessage(status, bodyText) {
+  const lower = String(bodyText || '').toLowerCase();
+  const code = Number(status) || 0;
+  const saved = ' The audio is saved — you can retry this session from the sidebar at any time.';
+
+  if (code === 402 || lower.includes('insufficient') || lower.includes('balance') ||
+      lower.includes('credit') || lower.includes('payment')) {
+    return 'AssemblyAI credits are used up. Top up at assemblyai.com/app, then retry.' + saved;
+  }
+  if (code === 401 || code === 403 || lower.includes('unauthorized') || lower.includes('invalid api key')) {
+    return 'AssemblyAI rejected the API key. Re-enter it in Settings, then retry.' + saved;
+  }
+  if (code === 429 || lower.includes('rate limit')) {
+    return 'AssemblyAI is rate-limiting this account. Wait a moment, then retry.' + saved;
+  }
+  if (code >= 500) {
+    return 'AssemblyAI had a server error (' + code + '). Retry in a minute.' + saved;
+  }
+  if (code === 400) {
+    return 'AssemblyAI rejected the audio (400). This usually means the recording is empty or corrupt.' + saved;
+  }
+  if (code === 0) {
+    return 'Could not reach AssemblyAI — check the internet connection, then retry.' + saved;
+  }
+  return 'Transcription failed (' + code + ').' + saved;
+}
+
+// Transcription — status vocabulary ----------------------------------------------
+//
+// One vocabulary shared by the live status line and the sidebar flags, so a
+// session in flight reads the same in both places.
+function transcriptionLabel(status) {
+  switch (status) {
+    case 'uploading':  return 'Uploading audio…';
+    case 'queued':     return 'Queued at AssemblyAI…';
+    case 'processing': return 'Transcribing…';
+    case 'completed':  return 'Transcribed';
+    case 'error':      return 'Transcription failed';
+    default:           return '';
+  }
+}
+
+// Whether a saved session still owes a transcript — it has audio on disk but no
+// text yet (transcription failed, was interrupted, or never ran).
+function needsTranscription(session) {
+  if (!session) return false;
+  if (String(session.transcript || '').trim()) return false;
+  return !!session.hasAudio;
+}
+
+// Whether a saved session has an actual note (older entries may carry an
+// all-empty soap object from before notes were saved with their session).
+function sessionHasNote(session) {
+  const soap = session && session.soap;
+  return !!soap && ['S', 'O', 'A', 'P'].some(k => {
+    const t = String(soap[k] || '').trim();
+    return t && t !== '—';
+  });
+}
+
+// Audio retention ----------------------------------------------------------------
+//
+// Recordings are large, so they cannot accumulate forever — but the rule is
+// deliberately conservative: audio is only ever dropped for a session that
+// already has a finished note AND has fallen outside the most recent
+// `keepRecent` entries. A session still waiting on a transcript or a note keeps
+// its audio no matter how old it is, because that audio is the only copy.
+// `sessions` is newest-first (see upsertSession). Returns ids safe to delete.
+function selectAudioToPrune(sessions, keepRecent) {
+  const keep = keepRecent == null ? 10 : keepRecent;
+  const out = [];
+  (sessions || []).forEach((s, i) => {
+    if (i < keep) return;
+    if (!s || !s.hasAudio) return;
+    if (!sessionHasNote(s)) return;
+    out.push(s.id);
+  });
+  return out;
+}
+
+// Spend estimation ---------------------------------------------------------------
+//
+// AssemblyAI bills per second of audio. Tracking cumulative seconds locally gives
+// a running estimate of the free-credit balance, so it can warn ahead of time
+// instead of transcription simply starting to fail mid-week.
+const ASSEMBLY_RATE_PER_HOUR = 0.36;   // Universal-3.5 Pro ($0.21) + Medical Mode ($0.15)
+const ASSEMBLY_FREE_GRANT    = 50.00;  // signup credit
+
+function estimateCost(seconds, ratePerHour) {
+  const rate = ratePerHour == null ? ASSEMBLY_RATE_PER_HOUR : ratePerHour;
+  const secs = Math.max(0, Number(seconds) || 0);
+  return (secs / 3600) * rate;
+}
+
+function creditStatus(spentUsd, grantUsd) {
+  const grant = grantUsd == null ? ASSEMBLY_FREE_GRANT : grantUsd;
+  const spent = Math.max(0, Number(spentUsd) || 0);
+  const remaining = Math.max(0, grant - spent);
+  let level = 'ok';
+  if (remaining <= 0) level = 'empty';
+  else if (remaining <= 5) level = 'low';
+  return { spent, remaining, level };
+}
+
+function formatUsd(n) {
+  const v = Math.max(0, Number(n) || 0);
+  return '$' + v.toFixed(2);
+}
+
+// Estimated hours of recording still affordable at the current rate.
+function hoursRemaining(remainingUsd, ratePerHour) {
+  const rate = ratePerHour == null ? ASSEMBLY_RATE_PER_HOUR : ratePerHour;
+  if (!rate) return 0;
+  return Math.max(0, (Number(remainingUsd) || 0) / rate);
+}
+
+// API key shape checks -----------------------------------------------------------
+
+function isLikelyAnthropicKey(key) {
+  return /^sk-ant-/.test(String(key || '').trim());
+}
+
+// AssemblyAI keys are a 32-char hex string today, but the check stays loose so a
+// future format change cannot lock the app out of a perfectly valid key.
+function isLikelyAssemblyKey(key) {
+  return /^[A-Za-z0-9._-]{20,}$/.test(String(key || '').trim());
 }
 
 // SOAP JSON parsing (tolerant of fences, prose, and token-cutoff truncation) ----
@@ -86,11 +266,12 @@ function parseSOAPResponse(rawText) {
   }
 }
 
-// Auto-save / crash recovery ----------------------------------------------------
-
-function serializeDraft(text, seconds, nowIso) {
-  return JSON.stringify({ transcript: text, duration: seconds, savedAt: nowIso });
-}
+// Legacy draft recovery ----------------------------------------------------------
+//
+// The `scribe_draft` slot belonged to the Web Speech era, when the live text was
+// the only copy of a session. Nothing writes it any more (the audio file is the
+// recovery copy now), but the reader is kept so a draft left in localStorage from
+// the previous build can still be restored on first load after the upgrade.
 
 function isDraftRestorable(draft) {
   return !!draft && typeof draft.transcript === 'string' && draft.transcript.trim().length > 0;
@@ -100,7 +281,8 @@ function isDraftRestorable(draft) {
 //
 // Insert a session at the front of the list, or replace it in place if an entry
 // with the same id already exists (a session is persisted at stop, then again
-// when its note is generated / edited). Returns a new array capped at `cap`.
+// when its transcript arrives and when its note is generated / edited). Returns a
+// new array capped at `cap`.
 function upsertSession(list, session, cap) {
   const sessions = (list || []).slice();
   const idx = sessions.findIndex(s => s.id === session.id);
@@ -108,32 +290,6 @@ function upsertSession(list, session, cap) {
   else sessions.unshift(session);
   const max = cap || 100;
   return sessions.length > max ? sessions.slice(0, max) : sessions;
-}
-
-// Human-readable messages for known SpeechRecognition failures ------------------
-//
-// Safari's error codes are cryptic and several map to fixable system settings
-// (see tests/SAFARI_CHECKLIST.md). Turn them into something a clinician can act on.
-function friendlyRecognitionError(code) {
-  switch (code) {
-    case 'not-allowed':
-      return 'Microphone/speech access was blocked. Allow it for this site, and make sure macOS Dictation is on (System Settings ▸ Keyboard ▸ Dictation).';
-    case 'service-not-available':
-      return 'The speech service is unavailable. On macOS, turn Dictation ON (System Settings ▸ Keyboard ▸ Dictation), then reload and try again.';
-    case 'network':
-      return 'Lost connection to the speech service — reconnecting…';
-    case 'audio-capture':
-      return 'No microphone was found. Check that the mic is connected and selected in System Settings ▸ Sound.';
-    case 'aborted':
-      return 'Recording was interrupted — restarting…';
-    default:
-      return 'Microphone error: ' + code;
-  }
-}
-
-// Whether an error code should be shown to the user (vs. handled silently) -------
-function isTransientRecognitionError(code) {
-  return code === 'no-speech' || code === 'aborted' || code === 'network';
 }
 
 // Diagnostics report formatting (PHI-free) --------------------------------------
@@ -146,7 +302,7 @@ function formatDiagnostics(entries, env) {
   lines.push('WCP Scribe diagnostics');
   lines.push('generated: ' + (e.generatedAt || ''));
   lines.push('browser:   ' + (e.userAgent || 'unknown'));
-  lines.push('speech supported: ' + (e.speechSupported ? 'yes' : 'no'));
+  lines.push('audio mime: ' + (e.audioMime || 'unknown'));
   lines.push('session events (no patient text is recorded):');
   lines.push('----------------------------------------');
   for (const entry of (entries || [])) {
@@ -161,16 +317,29 @@ function formatDiagnostics(entries, env) {
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     SAFETY_TERMS,
+    AUDIO_MIME_CANDIDATES,
+    ASSEMBLY_RATE_PER_HOUR,
+    ASSEMBLY_FREE_GRANT,
     hasSafetyDoc,
     selectCPT,
-    buildTranscript,
+    pickAudioMime,
+    micErrorMessage,
+    buildUtteranceTranscript,
+    assemblyErrorMessage,
+    transcriptionLabel,
+    needsTranscription,
+    sessionHasNote,
+    selectAudioToPrune,
+    estimateCost,
+    creditStatus,
+    formatUsd,
+    hoursRemaining,
+    isLikelyAnthropicKey,
+    isLikelyAssemblyKey,
     repairTruncatedJSON,
     parseSOAPResponse,
-    serializeDraft,
     isDraftRestorable,
     upsertSession,
-    friendlyRecognitionError,
-    isTransientRecognitionError,
     formatDiagnostics,
   };
 }

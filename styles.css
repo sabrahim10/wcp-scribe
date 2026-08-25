@@ -122,6 +122,12 @@ body {
   font-family: 'DM Mono', monospace;
   white-space: nowrap;
 }
+/* A session whose audio never made it through transcription — the one flag that
+   means something is actually owed, not just pending. */
+.session-item-flag.err {
+  color: #f0a0a0;
+  border-color: rgba(224,92,92,0.45);
+}
 
 .session-item-preview {
   font-size: 0.7rem;
@@ -240,6 +246,28 @@ header {
   font-weight: 500;
 }
 
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 0.9rem;
+  padding-bottom: 2px;
+}
+
+.settings-btn {
+  background: transparent;
+  border: 0.5px solid var(--card-border);
+  border-radius: 6px;
+  color: var(--muted);
+  padding: 0.25rem 0.7rem;
+  font-family: 'Outfit', sans-serif;
+  font-size: 0.68rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: border-color 0.2s, color 0.2s;
+}
+.settings-btn:hover { border-color: var(--teal); color: var(--teal); }
+
 .status-dot {
   width: 8px;
   height: 8px;
@@ -249,7 +277,6 @@ header {
   transition: background 0.4s;
 }
 .status-dot.live { background: var(--danger); box-shadow: 0 0 0 3px rgba(224,92,92,0.2); animation: pulse-dot 1.4s ease-in-out infinite; }
-.status-dot.reconnecting { background: #ffb432; box-shadow: 0 0 0 3px rgba(255,180,50,0.25); animation: pulse-dot 0.8s ease-in-out infinite; }
 .status-dot.done { background: var(--teal); }
 
 @keyframes pulse-dot {
@@ -373,6 +400,15 @@ header {
   50%      { transform: scaleY(1); }
 }
 
+/* While a real level meter is driving the bars, the decorative keyframe
+   animation must get out of the way — JS writes `transform` directly. No
+   transition here either: the meter repaints on its own ~12fps schedule, and a
+   transition would queue interpolations between every one of those writes. */
+.waveform.metered .bar {
+  animation: none !important;
+  transition: none;
+}
+
 /* ── Transcript ───────────────────────────────────────── */
 
 .transcript-section {
@@ -408,20 +444,62 @@ header {
   position: relative;
 }
 
-.transcript-box .cursor {
-  display: inline-block;
-  width: 2px;
-  height: 1em;
-  background: var(--teal);
-  margin-left: 2px;
-  vertical-align: text-bottom;
-  animation: blink 1s step-end infinite;
-}
-@keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
-
 .transcript-placeholder {
   color: var(--muted);
   font-style: italic;
+}
+
+/* ── Transcription status ─────────────────────────────── */
+
+.transcribe-status {
+  display: none;
+  align-items: center;
+  gap: 0.55rem;
+  font-size: 0.8rem;
+  color: var(--teal);
+  font-family: 'DM Mono', monospace;
+}
+.transcribe-status.visible { display: flex; }
+.transcribe-status.err { color: #f0a0a0; }
+
+.retry-btn {
+  align-self: flex-end;
+  background: transparent;
+  border: 0.5px solid rgba(46,196,163,0.4);
+  border-radius: 8px;
+  color: var(--teal);
+  padding: 0.5rem 1.1rem;
+  font-family: 'Outfit', sans-serif;
+  font-size: 0.78rem;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+.retry-btn:hover { background: var(--teal-glow); }
+
+/* ── Credit meter ─────────────────────────────────────── */
+
+.credit-meter {
+  font-size: 0.75rem;
+  color: var(--muted);
+  font-family: 'DM Mono', monospace;
+  padding: 0.5rem 0.9rem;
+  border: 0.5px solid var(--card-border);
+  border-radius: 8px;
+  background: var(--card-bg);
+  line-height: 1.5;
+}
+.credit-meter.low {
+  color: #ffd080;
+  border-color: rgba(255,180,50,0.3);
+  background: rgba(255,180,50,0.06);
+}
+.credit-meter.empty {
+  color: #f0a0a0;
+  border-color: rgba(224,92,92,0.3);
+  background: rgba(224,92,92,0.08);
 }
 
 /* ── Generate button ──────────────────────────────────── */
@@ -658,6 +736,7 @@ header {
   animation: spin 0.7s linear infinite;
   display: inline-block;
 }
+.spinner.sm { width: 12px; height: 12px; border-width: 1.5px; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
 /* ── New session / API key setup ──────────────────────── */
@@ -697,6 +776,22 @@ header {
   color: var(--muted-strong);
   line-height: 1.6;
 }
+.key-field { display: flex; flex-direction: column; gap: 0.4rem; }
+.key-label {
+  font-size: 0.65rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--teal);
+  font-weight: 500;
+}
+.setup-error {
+  display: none;
+  font-size: 0.8rem;
+  color: #f0a0a0;
+  line-height: 1.5;
+}
+.setup-error.visible { display: block; }
+
 .key-row { display: flex; gap: 0.75rem; }
 .key-input {
   flex: 1;
@@ -713,6 +808,7 @@ header {
 .key-input:focus { border-color: var(--teal); }
 .key-input::placeholder { color: var(--muted); }
 .key-save-btn {
+  align-self: flex-start;
   background: var(--teal);
   color: var(--navy);
   border: none;
@@ -730,13 +826,13 @@ header {
 
 .hidden { display: none !important; }
 
-/* Respect users/machines that ask for less motion — also cuts idle GPU work. */
+/* Respect users/machines that ask for less motion — also cuts idle GPU work.
+   The level meter checks this too and does not run at all when it is set. */
 @media (prefers-reduced-motion: reduce) {
   .pulse-ring.active,
   .status-dot.live,
-  .status-dot.reconnecting,
   .waveform.active .bar,
-  .transcript-box .cursor {
+  .spinner {
     animation: none !important;
   }
   .waveform.active .bar { transform: scaleY(0.5); }

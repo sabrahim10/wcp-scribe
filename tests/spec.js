@@ -24,6 +24,11 @@
     if (j(a) !== j(b)) throw new Error(msg || ('expected ' + j(b) + ', got ' + j(a)));
   }
   function ok(v, msg) { if (!v) throw new Error(msg || 'expected truthy, got ' + j(v)); }
+  function near(a, b, tol, msg) {
+    if (Math.abs(a - b) > (tol == null ? 1e-9 : tol)) {
+      throw new Error(msg || ('expected ~' + b + ', got ' + a));
+    }
+  }
   function throws(fn, msg) {
     let threw = false;
     try { fn(); } catch (e) { threw = true; }
@@ -64,45 +69,237 @@
     eq(H.hasSafetyDoc(undefined), false);
   });
 
-  // ── Transcript assembly / Safari double-text ─────────────────────────────────
+  // ── Audio format negotiation ─────────────────────────────────────────────────
 
-  test('buildTranscript: joins finals plus live interim', () => {
-    const out = H.buildTranscript('', [
-      { transcript: 'hello there', isFinal: true },
-      { transcript: 'how are', isFinal: false },
-    ]);
-    eq(out.text, 'hello there how are');
-    eq(out.final, 'hello there ');
+  test('pickAudioMime: prefers Opus where it is supported (Chrome)', () => {
+    const chrome = (t) => t.indexOf('webm') !== -1;
+    eq(H.pickAudioMime(chrome), 'audio/webm;codecs=opus');
+  });
+  test('pickAudioMime: falls back to MP4 in Safari (rejects every WebM type)', () => {
+    const safari = (t) => t.indexOf('mp4') !== -1;
+    eq(H.pickAudioMime(safari), 'audio/mp4;codecs=mp4a.40.2');
+  });
+  test('pickAudioMime: empty string when nothing is supported', () => {
+    eq(H.pickAudioMime(() => false), '');
+  });
+  test('pickAudioMime: a throwing isTypeSupported does not propagate', () => {
+    eq(H.pickAudioMime(() => { throw new Error('nope'); }), '');
+  });
+  test('pickAudioMime: tolerates a missing detector', () => {
+    eq(H.pickAudioMime(undefined), '');
+    eq(H.pickAudioMime(null), '');
   });
 
-  test('buildTranscript: dedupes Safari re-emitted final results', () => {
-    // Safari sometimes lists the same finalized phrase twice — must not double up.
-    const out = H.buildTranscript('', [
-      { transcript: 'the patient reports anxiety', isFinal: true },
-      { transcript: 'the patient reports anxiety', isFinal: true },
-    ]);
-    eq(out.text.trim(), 'the patient reports anxiety'); // once, not doubled
+  // ── Microphone error mapping ─────────────────────────────────────────────────
+
+  test('micErrorMessage: permission denial points at the site setting', () => {
+    ok(H.micErrorMessage('NotAllowedError').indexOf('Microphone access was blocked') === 0);
+    ok(H.micErrorMessage('SecurityError').toLowerCase().indexOf('microphone') !== -1);
+  });
+  test('micErrorMessage: missing / busy devices get distinct guidance', () => {
+    ok(H.micErrorMessage('NotFoundError').indexOf('No microphone was found') === 0);
+    ok(H.micErrorMessage('NotReadableError').indexOf('another app') !== -1);
+  });
+  test('micErrorMessage: unknown name falls back to the raw name', () => {
+    ok(H.micErrorMessage('WeirdError').indexOf('WeirdError') !== -1);
+    ok(H.micErrorMessage(undefined).indexOf('unknown error') !== -1);
   });
 
-  test('buildTranscript: carries base across a restart', () => {
-    // Simulates the restart loop: prior session text lives in `base`, new
-    // recognition session starts its results list over.
-    const out = H.buildTranscript('earlier text ', [{ transcript: 'new words', isFinal: true }]);
-    eq(out.text.trim(), 'earlier text new words');
-    eq(out.final, 'earlier text new words '); // trailing space keeps next word separate
+  // ── Speaker-labeled transcript assembly ──────────────────────────────────────
+
+  test('buildUtteranceTranscript: labels each speaker turn', () => {
+    const out = H.buildUtteranceTranscript([
+      { speaker: 'A', text: 'How have you been sleeping?' },
+      { speaker: 'B', text: 'About four hours a night.' },
+    ], 'flat fallback');
+    eq(out, 'Speaker A: How have you been sleeping?\nSpeaker B: About four hours a night.');
   });
 
-  test('buildTranscript: distinct consecutive finals are both kept', () => {
-    const out = H.buildTranscript('', [
-      { transcript: 'first sentence', isFinal: true },
-      { transcript: 'second sentence', isFinal: true },
-    ]);
-    eq(out.text.trim(), 'first sentence second sentence');
+  test('buildUtteranceTranscript: merges consecutive turns by one speaker', () => {
+    const out = H.buildUtteranceTranscript([
+      { speaker: 'B', text: 'I stopped the sertraline.' },
+      { speaker: 'B', text: 'It was making me nauseous.' },
+      { speaker: 'A', text: 'When did you stop?' },
+    ], '');
+    eq(out, 'Speaker B: I stopped the sertraline. It was making me nauseous.\nSpeaker A: When did you stop?');
   });
 
-  test('buildTranscript: empty/undefined results are safe', () => {
-    eq(H.buildTranscript('', []).text, '');
-    eq(H.buildTranscript('base ', undefined).text, 'base ');
+  test('buildUtteranceTranscript: falls back to flat text when diarization is empty', () => {
+    eq(H.buildUtteranceTranscript([], 'the flat transcript'), 'the flat transcript');
+    eq(H.buildUtteranceTranscript(null, 'the flat transcript'), 'the flat transcript');
+    eq(H.buildUtteranceTranscript(undefined, '  padded  '), 'padded');
+  });
+
+  test('buildUtteranceTranscript: skips blank utterances, keeps the rest', () => {
+    const out = H.buildUtteranceTranscript([
+      { speaker: 'A', text: 'Real line.' },
+      { speaker: 'B', text: '   ' },
+      { speaker: 'B', text: 'Another real line.' },
+    ], '');
+    eq(out, 'Speaker A: Real line.\nSpeaker B: Another real line.');
+  });
+
+  test('buildUtteranceTranscript: a missing speaker id does not lose the text', () => {
+    const out = H.buildUtteranceTranscript([{ text: 'unattributed words' }], '');
+    ok(out.indexOf('unattributed words') !== -1);
+  });
+
+  test('buildUtteranceTranscript: all-blank utterances fall back rather than return empty', () => {
+    eq(H.buildUtteranceTranscript([{ speaker: 'A', text: '  ' }], 'fallback text'), 'fallback text');
+  });
+
+  // ── Transcription error mapping ──────────────────────────────────────────────
+
+  test('assemblyErrorMessage: exhausted credits name the top-up page', () => {
+    ok(H.assemblyErrorMessage(402, '').indexOf('credits are used up') !== -1);
+    ok(H.assemblyErrorMessage(400, 'insufficient balance').indexOf('credits are used up') !== -1);
+  });
+  test('assemblyErrorMessage: auth failures point at the key', () => {
+    ok(H.assemblyErrorMessage(401, '').toLowerCase().indexOf('api key') !== -1);
+    ok(H.assemblyErrorMessage(403, '').toLowerCase().indexOf('api key') !== -1);
+  });
+  test('assemblyErrorMessage: rate limit, server error, and offline are distinct', () => {
+    ok(H.assemblyErrorMessage(429, '').indexOf('rate-limiting') !== -1);
+    ok(H.assemblyErrorMessage(503, '').indexOf('server error') !== -1);
+    ok(H.assemblyErrorMessage(0, '').indexOf('internet connection') !== -1);
+  });
+  test('assemblyErrorMessage: every message promises the audio is safe', () => {
+    [0, 400, 401, 402, 429, 500, 418].forEach(code => {
+      ok(H.assemblyErrorMessage(code, '').indexOf('audio is saved') !== -1,
+         'code ' + code + ' should reassure that audio is saved');
+    });
+  });
+
+  // ── Transcription status vocabulary ──────────────────────────────────────────
+
+  test('transcriptionLabel: known states read as progress', () => {
+    eq(H.transcriptionLabel('uploading'), 'Uploading audio…');
+    eq(H.transcriptionLabel('queued'), 'Queued at AssemblyAI…');
+    eq(H.transcriptionLabel('processing'), 'Transcribing…');
+    eq(H.transcriptionLabel('error'), 'Transcription failed');
+  });
+  test('transcriptionLabel: unknown state renders nothing', () => {
+    eq(H.transcriptionLabel('banana'), '');
+    eq(H.transcriptionLabel(undefined), '');
+  });
+
+  // ── Session state predicates ─────────────────────────────────────────────────
+
+  test('needsTranscription: audio present but no text', () => {
+    ok(H.needsTranscription({ hasAudio: true, transcript: '' }));
+    ok(H.needsTranscription({ hasAudio: true, transcript: '   ' }));
+  });
+  test('needsTranscription: false once text exists, or when there is no audio', () => {
+    eq(H.needsTranscription({ hasAudio: true, transcript: 'real words' }), false);
+    eq(H.needsTranscription({ hasAudio: false, transcript: '' }), false);
+    eq(H.needsTranscription(null), false);
+  });
+
+  test('sessionHasNote: real content in any field counts', () => {
+    ok(H.sessionHasNote({ soap: { S: 'subjective text' } }));
+    ok(H.sessionHasNote({ soap: { S: '', O: '', A: '', P: 'plan text' } }));
+  });
+  test('sessionHasNote: placeholder dashes and blanks do not count', () => {
+    eq(H.sessionHasNote({ soap: { S: '—', O: '—', A: '—', P: '—' } }), false);
+    eq(H.sessionHasNote({ soap: { S: '  ' } }), false);
+    eq(H.sessionHasNote({ soap: null }), false);
+    eq(H.sessionHasNote(null), false);
+  });
+
+  // ── Audio retention ──────────────────────────────────────────────────────────
+
+  test('selectAudioToPrune: keeps the most recent recordings untouched', () => {
+    const list = [];
+    for (let i = 0; i < 5; i++) list.push({ id: i, hasAudio: true, soap: { S: 'note' } });
+    deepEq(H.selectAudioToPrune(list, 10), []);
+  });
+
+  test('selectAudioToPrune: drops old audio once a note exists', () => {
+    const list = [];
+    for (let i = 0; i < 5; i++) list.push({ id: i, hasAudio: true, soap: { S: 'note' } });
+    deepEq(H.selectAudioToPrune(list, 2), [2, 3, 4]);
+  });
+
+  test('selectAudioToPrune: NEVER drops audio for a session without a note', () => {
+    // This is the whole safety property: audio is the only copy until a note
+    // exists, so age alone must never be enough to delete it.
+    const list = [
+      { id: 0, hasAudio: true, soap: { S: 'note' } },
+      { id: 1, hasAudio: true, soap: null },            // no note — must survive
+      { id: 2, hasAudio: true, soap: { S: '—' } },      // placeholder — must survive
+      { id: 3, hasAudio: true, soap: { S: 'note' } },
+    ];
+    deepEq(H.selectAudioToPrune(list, 0), [0, 3]);
+  });
+
+  test('selectAudioToPrune: ignores sessions that have no audio left', () => {
+    const list = [
+      { id: 0, hasAudio: false, soap: { S: 'note' } },
+      { id: 1, hasAudio: true,  soap: { S: 'note' } },
+    ];
+    deepEq(H.selectAudioToPrune(list, 0), [1]);
+  });
+
+  test('selectAudioToPrune: null/empty list tolerated', () => deepEq(H.selectAudioToPrune(null, 0), []));
+
+  // ── Spend estimation ─────────────────────────────────────────────────────────
+
+  test('estimateCost: bills per second at the medical-mode rate', () => {
+    near(H.estimateCost(3600), 0.36, 1e-9);
+    near(H.estimateCost(1800), 0.18, 1e-9);
+    eq(H.estimateCost(0), 0);
+  });
+  test('estimateCost: negative and junk input floor at zero', () => {
+    eq(H.estimateCost(-500), 0);
+    eq(H.estimateCost('abc'), 0);
+    eq(H.estimateCost(null), 0);
+  });
+  test('estimateCost: honours an explicit rate', () => near(H.estimateCost(3600, 0.21), 0.21, 1e-9));
+
+  test('creditStatus: healthy balance', () => {
+    const s = H.creditStatus(10);
+    near(s.remaining, 40, 1e-9);
+    eq(s.level, 'ok');
+  });
+  test('creditStatus: warns below $5 remaining', () => {
+    eq(H.creditStatus(45.01).level, 'low');
+    eq(H.creditStatus(46).level, 'low');
+  });
+  test('creditStatus: empty at or past the grant, never negative', () => {
+    eq(H.creditStatus(50).level, 'empty');
+    const over = H.creditStatus(75);
+    eq(over.level, 'empty');
+    eq(over.remaining, 0);
+  });
+
+  test('hoursRemaining: converts dollars back into recording time', () => {
+    near(H.hoursRemaining(0.36), 1, 1e-9);
+    near(H.hoursRemaining(18), 50, 1e-9);
+    eq(H.hoursRemaining(0), 0);
+  });
+
+  test('formatUsd: two decimals, never negative', () => {
+    eq(H.formatUsd(1.5), '$1.50');
+    eq(H.formatUsd(49.994), '$49.99');
+    eq(H.formatUsd(-3), '$0.00');
+  });
+
+  // ── API key shape checks ─────────────────────────────────────────────────────
+
+  test('isLikelyAnthropicKey: requires the sk-ant- prefix', () => {
+    ok(H.isLikelyAnthropicKey('sk-ant-api03-abc123'));
+    eq(H.isLikelyAnthropicKey('abc123'), false);
+    eq(H.isLikelyAnthropicKey(''), false);
+    eq(H.isLikelyAnthropicKey(null), false);
+  });
+  test('isLikelyAssemblyKey: accepts a 32-char hex key', () => {
+    ok(H.isLikelyAssemblyKey('20bcfb5738174dd493d29fa7d81e76b0'));
+  });
+  test('isLikelyAssemblyKey: rejects short input and anything with whitespace', () => {
+    eq(H.isLikelyAssemblyKey('short'), false);
+    eq(H.isLikelyAssemblyKey('has spaces in it somewhere here'), false);
+    eq(H.isLikelyAssemblyKey(''), false);
+    eq(H.isLikelyAssemblyKey(null), false);
   });
 
   // ── SOAP parsing ─────────────────────────────────────────────────────────────
@@ -119,14 +316,8 @@
   test('repairTruncatedJSON: produces parseable JSON', () => { JSON.parse(H.repairTruncatedJSON('{"P":"unterminated')); });
   test('parseSOAPResponse: throws on unsalvageable garbage', () => throws(() => H.parseSOAPResponse('not json at all')));
 
-  // ── Auto-save / recovery ─────────────────────────────────────────────────────
+  // ── Legacy draft recovery ────────────────────────────────────────────────────
 
-  test('serializeDraft round-trips', () => {
-    const d = JSON.parse(H.serializeDraft('hello world', 90, '2026-06-30T12:00:00.000Z'));
-    eq(d.transcript, 'hello world');
-    eq(d.duration, 90);
-    eq(d.savedAt, '2026-06-30T12:00:00.000Z');
-  });
   test('isDraftRestorable: only non-empty transcripts', () => {
     ok(H.isDraftRestorable({ transcript: 'real content' }));
     eq(H.isDraftRestorable({ transcript: '   ' }), false);
@@ -168,33 +359,18 @@
     eq(out[0].id, 1);
   });
 
-  // ── Error mapping / diagnostics ──────────────────────────────────────────────
+  // ── Diagnostics ──────────────────────────────────────────────────────────────
 
-  test('friendlyRecognitionError: maps known Safari codes to guidance', () => {
-    ok(H.friendlyRecognitionError('service-not-available').indexOf('Dictation') !== -1);
-    ok(H.friendlyRecognitionError('not-allowed').indexOf('Dictation') !== -1);
-    ok(H.friendlyRecognitionError('audio-capture').toLowerCase().indexOf('microphone') !== -1);
-    ok(H.friendlyRecognitionError('network').toLowerCase().indexOf('reconnect') !== -1);
-  });
-  test('friendlyRecognitionError: unknown code falls back to raw', () => {
-    ok(H.friendlyRecognitionError('weird-code').indexOf('weird-code') !== -1);
-  });
-  test('isTransientRecognitionError: classifies routine vs fatal', () => {
-    ok(H.isTransientRecognitionError('no-speech'));
-    ok(H.isTransientRecognitionError('aborted'));
-    ok(H.isTransientRecognitionError('network'));
-    eq(H.isTransientRecognitionError('service-not-available'), false);
-    eq(H.isTransientRecognitionError('not-allowed'), false);
-  });
   test('formatDiagnostics: renders events and never needs transcript text', () => {
     const report = H.formatDiagnostics(
-      [{ t: '2026-06-30T12:00:00Z', event: 'record_start' }, { t: '2026-06-30T12:01:00Z', event: 'recognition_error', detail: 'network' }],
-      { generatedAt: '2026-06-30T12:05:00Z', userAgent: 'TestUA', speechSupported: true }
+      [{ t: '2026-08-24T12:00:00Z', event: 'record_start' }, { t: '2026-08-24T12:01:00Z', event: 'transcribe_error', detail: 'network' }],
+      { generatedAt: '2026-08-24T12:05:00Z', userAgent: 'TestUA', audioMime: 'audio/mp4' }
     );
     ok(report.indexOf('record_start') !== -1);
-    ok(report.indexOf('recognition_error') !== -1);
+    ok(report.indexOf('transcribe_error') !== -1);
     ok(report.indexOf('network') !== -1);
     ok(report.indexOf('TestUA') !== -1);
+    ok(report.indexOf('audio/mp4') !== -1);
   });
   test('formatDiagnostics: handles empty log', () => {
     ok(H.formatDiagnostics([], { userAgent: 'x' }).indexOf('no events') !== -1);
