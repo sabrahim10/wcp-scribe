@@ -1,0 +1,293 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scribe — Audio Recovery</title>
+<style>
+  :root {
+    --bg: #f7f7f5; --card: #fff; --ink: #1a1a18; --muted: #6b6b66;
+    --line: #e3e3df; --accent: #4a5568; --ok: #1a7f4b; --bad: #b4341f;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #16161a; --card: #1e1e23; --ink: #ececea; --muted: #9a9a94;
+      --line: #33333a; --accent: #8fa1bd; --ok: #4ec27f; --bad: #f0806a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 28px 20px 60px; background: var(--bg); color: var(--ink);
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  .wrap { max-width: 760px; margin: 0 auto; }
+  h1 { font-size: 21px; margin: 0 0 6px; }
+  .sub { color: var(--muted); margin: 0 0 22px; }
+  button {
+    font: inherit; font-weight: 600; padding: 9px 16px; border-radius: 8px;
+    border: 1px solid var(--line); background: var(--card); color: var(--ink); cursor: pointer;
+  }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: .5; cursor: default; }
+  .card {
+    background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+    padding: 16px 18px; margin-bottom: 14px;
+  }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 12px; }
+  .title { font-weight: 600; }
+  .meta { color: var(--muted); font-size: 13.5px; margin-top: 3px; }
+  .verdict { margin-top: 10px; padding: 9px 12px; border-radius: 7px; font-size: 13.5px; }
+  .verdict.ok  { background: rgba(26,127,75,.10); color: var(--ok); }
+  .verdict.bad { background: rgba(180,52,31,.10); color: var(--bad); }
+  code { font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .hex { margin-top: 8px; color: var(--muted); overflow-x: auto; white-space: nowrap; }
+  .note { color: var(--muted); font-size: 13.5px; margin-top: 22px; }
+  .step { margin: 0 0 6px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>Scribe — Audio Recovery</h1>
+  <p class="sub">Saves recorded audio out of this browser so it can be repaired. Nothing here deletes or changes anything.</p>
+
+  <div class="card">
+    <button class="primary" id="scanBtn" onclick="scan()">Find recordings on this computer</button>
+    <div class="meta" id="scanNote" style="margin-top:10px">
+      Every download lands in your Downloads folder. Send the files to Sami.
+    </div>
+  </div>
+
+  <div id="results"></div>
+
+  <div class="card">
+    <div class="title">Diagnostics</div>
+    <div class="meta">Technical log only — event names, error codes, timings. Contains no patient information and no transcript text.</div>
+    <div class="row"><button onclick="downloadDiagnostics()">Download diagnostics</button></div>
+  </div>
+
+  <p class="note">
+    If this page says it found nothing, the browser may be in Private Browsing (which blocks stored audio),
+    or this is not the same browser the session was recorded in.
+  </p>
+
+</div>
+
+<script>
+const AUDIO_DB = 'scribe_audio';
+const AUDIO_STORE = 'chunks';
+
+function openDb() {
+  return new Promise((resolve, reject) => {
+    let req;
+    try { req = indexedDB.open(AUDIO_DB); } catch (e) { reject(e); return; }
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+// Enumerate keys only. Loading every chunk up front would pull hundreds of
+// megabytes into memory; the audio for one session is read only when asked for.
+function listSessions(db) {
+  return new Promise((resolve, reject) => {
+    if (!db.objectStoreNames.contains(AUDIO_STORE)) { resolve([]); return; }
+    const req = db.transaction(AUDIO_STORE, 'readonly').objectStore(AUDIO_STORE).getAllKeys();
+    req.onsuccess = () => {
+      const bySession = new Map();
+      (req.result || []).forEach(key => {
+        const sid = key[0], seq = key[1];
+        if (!bySession.has(sid)) bySession.set(sid, []);
+        bySession.get(sid).push(seq);
+      });
+      const out = [];
+      bySession.forEach((seqs, sid) => {
+        seqs.sort((a, b) => a - b);
+        out.push({ sid, count: seqs.length, first: seqs[0], last: seqs[seqs.length - 1] });
+      });
+      out.sort((a, b) => b.sid - a.sid);
+      resolve(out);
+    };
+    req.onerror = () => reject(req.error);
+  });
+}
+
+function getChunk(db, sid, seq) {
+  return new Promise((resolve, reject) => {
+    const req = db.transaction(AUDIO_STORE, 'readonly').objectStore(AUDIO_STORE).get([sid, seq]);
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+function getRows(db, sid) {
+  return new Promise((resolve, reject) => {
+    const req = db.transaction(AUDIO_STORE, 'readonly').objectStore(AUDIO_STORE)
+                  .index('bySession').getAll(sid);
+    req.onsuccess = () => resolve((req.result || []).slice().sort((a, b) => a.seq - b.seq));
+    req.onerror = () => reject(req.error);
+  });
+}
+
+// The whole diagnosis in one line: a playable file starts with a container
+// header. MP4 carries "ftyp" at byte 4; WebM opens with the EBML magic number.
+// Anything else is what AssemblyAI reports as an unidentifiable "data" file.
+function inspectHeader(bytes) {
+  const ascii = [...bytes].map(b => (b > 31 && b < 127) ? String.fromCharCode(b) : '.').join('');
+  const hex = [...bytes].map(b => b.toString(16).padStart(2, '0')).join(' ');
+  let verdict, good = false;
+  if (ascii.slice(4, 8) === 'ftyp') { verdict = 'Valid MP4 header — this file should play.'; good = true; }
+  else if (bytes[0] === 0x1a && bytes[1] === 0x45 && bytes[2] === 0xdf && bytes[3] === 0xa3) {
+    verdict = 'Valid WebM header — this file should play.'; good = true;
+  } else {
+    verdict = 'No container header at the start of this file. This is the failure — it is why transcription was rejected. The audio itself is still here and is very likely repairable.';
+  }
+  return { ascii, hex, verdict, good };
+}
+
+function saveBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 30000);
+}
+
+function label(sid) {
+  const d = new Date(Number(sid));
+  return isNaN(d.getTime()) ? String(sid)
+    : d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) + ' at ' +
+      d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+}
+
+let db = null;
+
+async function scan() {
+  const btn = document.getElementById('scanBtn');
+  const results = document.getElementById('results');
+  btn.disabled = true;
+  results.innerHTML = '<div class="card">Looking…</div>';
+
+  try {
+    db = await openDb();
+    const found = await listSessions(db);
+    if (!found.length) {
+      results.innerHTML = '<div class="card">No saved audio found in this browser.</div>';
+      btn.disabled = false;
+      return;
+    }
+
+    // Session ids known to the app; anything else is audio the app itself can
+    // no longer reach, and is the most important thing on this page to rescue.
+    let known = new Set();
+    try {
+      known = new Set(JSON.parse(localStorage.getItem('scribe_sessions') || '[]').map(s => String(s.id)));
+    } catch (e) {}
+
+    results.innerHTML = '';
+    for (const s of found) {
+      const head = await getChunk(db, s.sid, s.first);
+      const bytes = head && head.blob
+        ? new Uint8Array(await head.blob.slice(0, 16).arrayBuffer())
+        : new Uint8Array(16);
+      const info = inspectHeader(bytes);
+      const mins = Math.round(s.count * 5 / 60);
+
+      const card = document.createElement('div');
+      card.className = 'card';
+      card.innerHTML =
+        '<div class="title">' + label(s.sid) +
+          (known.has(String(s.sid)) ? '' : ' — not listed in the app') + '</div>' +
+        '<div class="meta">' + s.count + ' pieces · about ' + mins + ' minute' + (mins === 1 ? '' : 's') +
+          ' · format ' + ((head && head.mime) || 'unknown') + '</div>' +
+        '<div class="verdict ' + (info.good ? 'ok' : 'bad') + '">' + info.verdict + '</div>' +
+        '<div class="hex"><code>' + info.ascii + '</code><br><code>' + info.hex + '</code></div>' +
+        '<div class="row">' +
+          '<button class="primary" data-act="audio">Download the recording</button>' +
+          '<button data-act="manifest">Download piece list</button>' +
+          '<button data-act="first">Download first piece only</button>' +
+        '</div>' +
+        '<div class="meta" id="st-' + s.sid + '"></div>';
+
+      card.querySelector('[data-act="audio"]').onclick    = () => saveSession(s.sid);
+      card.querySelector('[data-act="manifest"]').onclick = () => saveManifest(s.sid);
+      card.querySelector('[data-act="first"]').onclick    = () => saveFirst(s.sid, s.first);
+      results.appendChild(card);
+    }
+  } catch (e) {
+    results.innerHTML = '<div class="card">Could not read saved audio: ' +
+      String((e && e.message) || e) + '</div>';
+  }
+  btn.disabled = false;
+}
+
+function status(sid, msg) {
+  const el = document.getElementById('st-' + sid);
+  if (el) el.textContent = msg;
+}
+
+async function saveSession(sid) {
+  status(sid, 'Gathering the audio — this can take a minute for a long session…');
+  try {
+    const rows = await getRows(db, sid);
+    const blob = new Blob(rows.map(r => r.blob), { type: 'application/octet-stream' });
+    saveBlob(blob, 'scribe-' + sid + '.bin');
+    status(sid, 'Saved to Downloads (' + (blob.size / 1048576).toFixed(1) + ' MB).');
+  } catch (e) {
+    status(sid, 'Could not save: ' + String((e && e.message) || e));
+  }
+}
+
+// Chunk boundaries, so a broken container can be split back into its original
+// pieces and reassembled correctly offline.
+async function saveManifest(sid) {
+  status(sid, 'Building the piece list…');
+  try {
+    const rows = await getRows(db, sid);
+    const manifest = {
+      sessionId: sid,
+      recordedAt: new Date(Number(sid)).toISOString(),
+      mime: rows.length ? rows[0].mime : null,
+      chunkCount: rows.length,
+      chunks: rows.map(r => ({ seq: r.seq, bytes: r.blob.size })),
+    };
+    saveBlob(new Blob([JSON.stringify(manifest, null, 2)], { type: 'application/json' }),
+             'scribe-' + sid + '-manifest.json');
+    status(sid, 'Piece list saved to Downloads.');
+  } catch (e) {
+    status(sid, 'Could not save: ' + String((e && e.message) || e));
+  }
+}
+
+async function saveFirst(sid, seq) {
+  try {
+    const row = await getChunk(db, sid, seq);
+    if (!row) { status(sid, 'First piece not found.'); return; }
+    saveBlob(row.blob, 'scribe-' + sid + '-piece0.bin');
+    status(sid, 'First piece saved to Downloads.');
+  } catch (e) {
+    status(sid, 'Could not save: ' + String((e && e.message) || e));
+  }
+}
+
+function downloadDiagnostics() {
+  const out = { generatedAt: new Date().toISOString(), userAgent: navigator.userAgent };
+  try { out.diag = JSON.parse(localStorage.getItem('scribe_diag') || '[]'); }
+  catch (e) { out.diag = 'unreadable'; }
+  try {
+    // Metadata only — transcript text is deliberately reduced to a length.
+    out.sessions = JSON.parse(localStorage.getItem('scribe_sessions') || '[]').map(s => ({
+      id: s.id, date: s.date, duration: s.duration, hasAudio: s.hasAudio,
+      transcriptionStatus: s.transcriptionStatus, transcriptionError: s.transcriptionError,
+      assemblyId: s.assemblyId, transcriptChars: String(s.transcript || '').length,
+      hasNote: !!s.soap,
+    }));
+  } catch (e) { out.sessions = 'unreadable'; }
+  saveBlob(new Blob([JSON.stringify(out, null, 2)], { type: 'application/json' }),
+           'scribe-diagnostics.json');
+}
+</script>
+</body>
+</html>
