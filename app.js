@@ -1339,6 +1339,33 @@ function renderTranscript(text) {
   const box = document.getElementById('transcriptText');
   box.textContent = text || '';
   document.getElementById('transcriptPlaceholder').style.display = (text || '').trim() ? 'none' : '';
+  updateTranscriptToggle(text || '');
+}
+
+// The transcript box is capped and scrolls internally; this shows how much is in
+// there and offers to open it in full. A short transcript needs neither, so the
+// control only appears once there is actually something to collapse.
+function updateTranscriptToggle(text) {
+  const btn = document.getElementById('transcriptToggle');
+  const boxEl = document.getElementById('transcriptBox');
+  if (!btn || !boxEl) return;
+
+  const words = countWords(text);
+  if (!words) {
+    btn.classList.add('hidden');
+    boxEl.classList.remove('expanded');
+    return;
+  }
+  btn.classList.remove('hidden');
+  const expanded = boxEl.classList.contains('expanded');
+  btn.textContent = words.toLocaleString() + ' words · ' + (expanded ? 'Collapse' : 'Expand');
+}
+
+function toggleTranscript() {
+  const boxEl = document.getElementById('transcriptBox');
+  boxEl.classList.toggle('expanded');
+  if (!boxEl.classList.contains('expanded')) boxEl.scrollTop = 0;
+  updateTranscriptToggle(document.getElementById('transcriptText').textContent);
 }
 
 function setTranscriptPlaceholder(msg) {

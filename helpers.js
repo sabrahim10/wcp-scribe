@@ -106,6 +106,16 @@ function buildUtteranceTranscript(utterances, fallbackText) {
   return lines.length ? lines.join('\n') : String(fallbackText || '').trim();
 }
 
+// Word count for the transcript header. Speaker labels ("Speaker A:") are part
+// of the text but are not words anyone said, so they are dropped first —
+// otherwise an hour of quick back-and-forth reads as hundreds of words longer
+// than it is.
+function countWords(text) {
+  const body = String(text || '').replace(/^\s*Speaker\s+\w+:\s*/gm, ' ');
+  const words = body.trim().split(/\s+/).filter(Boolean);
+  return words.length;
+}
+
 // Transcription — error mapping --------------------------------------------------
 //
 // Every message ends by saying the audio is safe, because it always is: the
@@ -367,6 +377,7 @@ if (typeof module !== 'undefined' && module.exports) {
     pickAudioMime,
     micErrorMessage,
     buildUtteranceTranscript,
+    countWords,
     assemblyErrorMessage,
     noteErrorMessage,
     transcriptionLabel,

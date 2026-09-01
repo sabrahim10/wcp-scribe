@@ -148,6 +148,17 @@
     eq(H.buildUtteranceTranscript([{ speaker: 'A', text: '  ' }], 'fallback text'), 'fallback text');
   });
 
+  // ── Transcript word count ────────────────────────────────────────────────────
+
+  test('countWords: speaker labels are not counted as spoken words', () => {
+    eq(H.countWords('Speaker A: hello there\nSpeaker B: hi'), 3);
+  });
+  test('countWords: plain text and odd spacing', () => {
+    eq(H.countWords('  one   two \n three '), 3);
+    eq(H.countWords(''), 0);
+    eq(H.countWords(null), 0);
+  });
+
   // ── Transcription error mapping ──────────────────────────────────────────────
 
   test('assemblyErrorMessage: exhausted credits name the top-up page', () => {

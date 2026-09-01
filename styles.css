@@ -451,6 +451,29 @@ header {
   font-weight: 500;
 }
 
+.transcript-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+/* Sits on the section label row, so the transcript's length and the control for
+   it are visible without scrolling to find them. */
+.transcript-toggle {
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 0.7rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+  transition: color 0.2s;
+}
+.transcript-toggle:hover { color: var(--teal); }
+
 .transcript-box {
   background: var(--card-bg);
   border: 0.5px solid var(--card-border);
@@ -464,6 +487,16 @@ header {
   font-weight: 300;
   white-space: pre-wrap;
   position: relative;
+  /* An hour-long visit runs ~50,000 characters. Left uncapped that turned the
+     page into a mile of scrolling to reach the note below it, so the transcript
+     scrolls inside its own box and the toggle opens it in full when wanted. */
+  max-height: 22rem;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.transcript-box.expanded {
+  max-height: none;
+  overflow-y: visible;
 }
 
 .transcript-placeholder {
