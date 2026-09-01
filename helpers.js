@@ -138,12 +138,54 @@ function assemblyErrorMessage(status, bodyText) {
   return 'Transcription failed (' + code + ').' + saved;
 }
 
+// Note generation — error mapping ------------------------------------------------
+//
+// The counterpart to assemblyErrorMessage, for the Anthropic call. By the time
+// this can fire the transcript is already in `scribe_sessions` (transcribeSession
+// writes it there before it is ever drawn on screen), so every message names the
+// cause, the fix, and — first, because that is the question the physician is
+// actually asking — the fact that nothing has been lost.
+function noteErrorMessage(status, bodyText) {
+  const lower = String(bodyText || '').toLowerCase();
+  const code = Number(status) || 0;
+  const saved = 'The transcript is saved. Open this session from the sidebar and generate the note again whenever you like — ';
+
+  if (lower.includes('credit balance') || lower.includes('insufficient') || code === 402) {
+    return saved + 'the Anthropic account is out of credit. Top up at console.anthropic.com, then generate again.';
+  }
+  if (code === 401 || code === 403 || lower.includes('authentication') || lower.includes('invalid x-api-key')) {
+    return saved + 'Anthropic rejected the API key. Re-enter it with the Keys button, then generate again.';
+  }
+  // Narrow on purpose: "model" appears in plenty of unrelated 400s, and telling
+  // her to check account access when the real fault is elsewhere sends her to the
+  // wrong place.
+  if (code === 404 || lower.includes('not_found') || lower.includes('model:')) {
+    return saved + 'this Anthropic account cannot reach the model the app asks for. Check the key belongs to an account with Claude API access.';
+  }
+  if (code === 429 || lower.includes('rate limit')) {
+    return saved + 'Anthropic is rate-limiting this account. Wait a minute, then generate again.';
+  }
+  if (code === 529 || lower.includes('overloaded')) {
+    return saved + 'Anthropic is overloaded right now. Try again in a minute.';
+  }
+  if (code >= 500) {
+    return saved + 'Anthropic had a server error (' + code + '). Try again in a minute.';
+  }
+  if (code === 0) {
+    return saved + 'the request never reached Anthropic — check the internet connection, then generate again.';
+  }
+  return saved + 'the note request failed (' + code + ').';
+}
+
 // Transcription — status vocabulary ----------------------------------------------
 //
 // One vocabulary shared by the live status line and the sidebar flags, so a
 // session in flight reads the same in both places.
 function transcriptionLabel(status) {
   switch (status) {
+    // A session is banked to history the moment recording starts, so this state
+    // is what a still-running (or abandoned) recording reads as in the sidebar.
+    case 'recording':  return 'Recording…';
     case 'uploading':  return 'Uploading audio…';
     case 'queued':     return 'Queued at AssemblyAI…';
     case 'processing': return 'Transcribing…';
@@ -326,6 +368,7 @@ if (typeof module !== 'undefined' && module.exports) {
     micErrorMessage,
     buildUtteranceTranscript,
     assemblyErrorMessage,
+    noteErrorMessage,
     transcriptionLabel,
     needsTranscription,
     sessionHasNote,

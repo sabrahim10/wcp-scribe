@@ -18,6 +18,7 @@ let isRecording = false;
 let transcript  = '';
 let timerInterval = null;
 let timerSeconds  = 0;
+let timerStartedAt = 0;   // wall-clock start; setInterval ticks are throttled
 let soapData    = null;
 let sessions    = JSON.parse(localStorage.getItem('scribe_sessions') || '[]');
 let viewMode    = false;
@@ -55,6 +56,14 @@ const POLL_MS    = 3000;       // AssemblyAI status poll interval
 const POLL_MAX_MS = 30 * 60 * 1000;
 const SILENCE_HINT_MS = 20000; // no sound at all this long → likely wrong input
 const AUDIO_KEEP_RECENT = 10;  // recordings kept regardless of note status
+
+// Declared up here, not next to transcribeSession, because resumeUnfinishedWork()
+// runs during initial script execution — before a `const` further down the file
+// has been initialized. Resuming a job that already has an assemblyId reaches the
+// poll loop with no preceding await, so a later declaration is still in its
+// temporal dead zone and every resumed transcription died with
+// "Cannot access 'sleep' before initialization".
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 const ASSEMBLY_BASE = 'https://api.assemblyai.com';
 
@@ -203,17 +212,66 @@ function putAudioChunk(sessionId, seq, blob, mime) {
   }));
 }
 
-function getAudioBlob(sessionId) {
+// Chunk sequence numbers for a session — keys only, so this stays cheap even
+// for a 750-chunk recording.
+function getAudioSeqs(sessionId) {
   return audioDB().then(db => new Promise((resolve, reject) => {
-    const tx  = db.transaction(AUDIO_STORE, 'readonly');
-    const req = tx.objectStore(AUDIO_STORE).index('bySession').getAll(sessionId);
-    req.onsuccess = () => {
-      const rows = (req.result || []).slice().sort((a, b) => a.seq - b.seq);
-      if (!rows.length) { resolve(null); return; }
-      resolve(new Blob(rows.map(r => r.blob), { type: rows[0].mime || 'audio/webm' }));
-    };
+    const req = db.transaction(AUDIO_STORE, 'readonly').objectStore(AUDIO_STORE)
+                  .index('bySession').getAllKeys(sessionId);
+    req.onsuccess = () => resolve((req.result || []).map(k => k[1]).sort((a, b) => a - b));
     req.onerror = () => reject(req.error);
   }));
+}
+
+function getAudioChunk(sessionId, seq) {
+  return audioDB().then(db => new Promise((resolve, reject) => {
+    const req = db.transaction(AUDIO_STORE, 'readonly').objectStore(AUDIO_STORE)
+                  .get([sessionId, seq]);
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror = () => reject(req.error);
+  }));
+}
+
+// Reassemble a session's audio into one uploadable file.
+//
+// Safari returns Blob references from IndexedDB that stop resolving once the
+// transaction that produced them has completed: `.size` keeps reporting the
+// right number, but reading the bytes yields a truncated result, or nothing.
+// Building the upload body from a single getAll() therefore put short, garbled
+// bodies on the wire — a 31-minute session uploaded 10.6 MB of an expected
+// ~38 MB, then 114 KB on retry — which AssemblyAI rejects as an unidentifiable
+// "(data)" file. It looked non-deterministic because it is.
+//
+// So each chunk's bytes are pulled while that chunk's own transaction is still
+// alive, and the assembled length is checked against what the chunks claim.
+// A short read fails here, loudly, instead of becoming a confusing rejection
+// several minutes later.
+async function getAudioBlob(sessionId) {
+  const seqs = await getAudioSeqs(sessionId);
+  if (!seqs.length) return null;
+
+  const parts = [];
+  let declared = 0, actual = 0, mime = '';
+  for (const seq of seqs) {
+    const row = await getAudioChunk(sessionId, seq);
+    if (!row || !row.blob) continue;
+    if (!mime) mime = row.mime || '';
+    declared += row.blob.size;
+    const buf = await row.blob.arrayBuffer();
+    actual += buf.byteLength;
+    parts.push(buf);
+  }
+
+  if (!actual) return null;
+  if (actual !== declared || parts.length !== seqs.length) {
+    diag('audio_assembly_short',
+         'chunks:' + parts.length + '/' + seqs.length + ' bytes:' + actual + '/' + declared);
+    throw new Error('Only part of this recording could be read back from the browser (' +
+      parts.length + ' of ' + seqs.length + ' pieces). Nothing was sent, and the audio is ' +
+      'still saved — retry, and if it keeps failing use the recovery page to save the file.');
+  }
+  diag('audio_assembled', 'chunks:' + parts.length + ' bytes:' + actual);
+  return new Blob(parts, { type: mime || 'audio/webm' });
 }
 
 function deleteAudio(sessionId) {
@@ -283,6 +341,20 @@ async function startRecording() {
   chunkErrors = 0;
   sawSound    = false;
   isRecording = true;
+  // Before the record-start persist below, or this session's history entry is
+  // written carrying the previous recording's duration.
+  timerSeconds = 0;
+
+  // Clear the previous note off the screen before the new session id exists.
+  // persistSession() reads the SOAP straight out of the DOM, so a note left
+  // showing from the last patient would be saved onto this recording — and it
+  // would also simply sit there on screen during someone else's visit. (This
+  // bit the save at stop too, not just the new save at start.)
+  soapData = null;
+  ['soapS', 'soapO', 'soapA', 'soapP'].forEach(id => document.getElementById(id).textContent = '');
+  document.getElementById('soapSection').classList.remove('visible');
+  document.getElementById('cptRow').classList.remove('visible');
+  document.getElementById('safetyWarning').classList.remove('visible');
 
   // Each recording is its own history entry, dated by when it was recorded.
   currentSessionId = Date.now();
@@ -347,6 +419,13 @@ async function startRecording() {
     return;
   }
 
+  // Banked to history now, not at stop. Chunks start landing in IndexedDB
+  // immediately, and until a session record names them nothing in the app can
+  // reach them — a page death mid-recording used to strand the whole session
+  // invisibly (two lost intakes on Aug 31, 2026, one of them 40 minutes).
+  // resumeUnfinishedWork() finds this record on the next load and offers it.
+  persistSession({ hasAudio: true, audioMime, transcriptionStatus: 'recording' });
+
   diag('record_start', 'mime:' + (audioMime || 'default'));
   startMeter(stream);
 
@@ -365,10 +444,16 @@ async function startRecording() {
   setTranscriptPlaceholder('Recording. The transcript is produced after you press stop.');
   setTranscribeStatus('', '');
 
+  // Wall clock, not a tick count. Safari throttles setInterval hard in a
+  // backgrounded tab, so incrementing a counter under-reported long sessions
+  // badly — one 16.5-minute recording displayed as 8m 21s. That number is
+  // stored as the session duration and drives CPT selection, so a throttled
+  // timer is a billing error, not just a cosmetic one.
+  timerStartedAt = Date.now();
   timerSeconds = 0;
   document.getElementById('timer').textContent = '00:00';
   timerInterval = setInterval(() => {
-    timerSeconds++;
+    timerSeconds = Math.floor((Date.now() - timerStartedAt) / 1000);
     const m = String(Math.floor(timerSeconds / 60)).padStart(2, '0');
     const s = String(timerSeconds % 60).padStart(2, '0');
     document.getElementById('timer').textContent = m + ':' + s;
@@ -393,6 +478,9 @@ function stopRecording(onFinished) {
   if (!isRecording) return;
   isRecording = false;
   clearInterval(timerInterval);
+  // Settle the duration from the clock, not from whatever the last (possibly
+  // throttled) tick happened to leave behind.
+  if (timerStartedAt) timerSeconds = Math.floor((Date.now() - timerStartedAt) / 1000);
   clearTimeout(silenceTimer);
   stopMeter();
 
@@ -574,8 +662,6 @@ async function assemblyFetch(id) {
   return res.json();
 }
 
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-
 // Upload → submit → poll. Safe to call for any session id, live or historical.
 // Every state change is written to the session record, so closing the tab
 // mid-transcription loses nothing: resumeUnfinishedWork() picks it back up.
@@ -756,11 +842,24 @@ TRANSCRIPT:
 
 Respond with only the JSON object, no markdown, no explanation.`;
 
+// An error whose message is already written for the physician — shown verbatim,
+// with no raw API text bolted onto it.
+function friendlyError(message) {
+  const err = new Error(message);
+  err.friendly = true;
+  return err;
+}
+
 async function generateSOAP() {
   const viewing = viewMode ? findSession(viewingSessionId) : null;
   const sourceText = viewing ? (viewing.transcript || '') : transcript;
-  if (!sourceText.trim()) return;
   if (isRecording) { stopRecording(); return; }
+  if (!sourceText.trim()) {
+    showError('There is no transcript for this session yet, so there is nothing to write a note from. ' +
+      'If the recording is still transcribing, wait for it to finish; if transcription failed, ' +
+      'the audio is saved — reopen the session from the sidebar and use "Transcribe from saved audio".');
+    return;
+  }
 
   const btn = document.getElementById('generateBtn');
   btn.disabled = true;
@@ -769,29 +868,41 @@ async function generateSOAP() {
   diag('generate_start', 'transcriptLen:' + sourceText.length);
 
   try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01',
-        'anthropic-dangerous-direct-browser-access': 'true'
-      },
-      body: JSON.stringify({
-        model: 'claude-opus-5',
-        max_tokens: 8000,
-        messages: [{ role: 'user', content: SOAP_PROMPT.replace('{{transcript}}', sourceText) }]
-      })
-    });
+    let response;
+    try {
+      response = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': apiKey,
+          'anthropic-version': '2023-06-01',
+          'anthropic-dangerous-direct-browser-access': 'true'
+        },
+        body: JSON.stringify({
+          model: 'claude-opus-5',
+          max_tokens: 8000,
+          messages: [{ role: 'user', content: SOAP_PROMPT.replace('{{transcript}}', sourceText) }]
+        })
+      });
+    } catch (netErr) {
+      throw friendlyError(noteErrorMessage(0, String((netErr && netErr.message) || '')));
+    }
 
     if (!response.ok) {
-      const err = await response.json().catch(() => ({}));
-      throw new Error((err.error && err.error.message) || 'API error ' + response.status);
+      const bodyText = await response.text().catch(() => '');
+      diag('generate_http', 'status:' + response.status);
+      throw friendlyError(noteErrorMessage(response.status, bodyText));
     }
 
     const data = await response.json();
     const textBlock = (data.content || []).find(b => b.type === 'text');
-    const parsed = parseSOAPResponse(textBlock ? textBlock.text : '');
+    let parsed;
+    try {
+      parsed = parseSOAPResponse(textBlock ? textBlock.text : '');
+    } catch (parseErr) {
+      throw friendlyError('The transcript is saved. Claude returned a note that could not be read ' +
+        '(malformed JSON) — generate again, which almost always fixes it.');
+    }
 
     document.getElementById('soapS').textContent = parsed.S || '—';
     document.getElementById('soapO').textContent = parsed.O || '—';
@@ -822,8 +933,10 @@ async function generateSOAP() {
 
   } catch (err) {
     diag('generate_error', err.message);
-    showError('Error generating note: ' + err.message +
-      ' — the transcript is already saved in the session list, so you can retry now or later.');
+    showError(err && err.friendly
+      ? err.message
+      : 'The transcript is saved in the session list — generating the note failed (' +
+        String((err && err.message) || err) + '), so retry now or later; nothing is lost.');
   } finally {
     btn.disabled = false;
     btn.innerHTML = 'Generate SOAP Note';
@@ -940,9 +1053,12 @@ function renderSidebar() {
 
     let flag = '';
     if (needsTranscription(s)) {
-      flag = s.transcriptionStatus === 'error'
-        ? '<span class="session-item-flag err">Needs transcript</span>'
-        : '<span class="session-item-flag">Transcribing…</span>';
+      if (s.transcriptionStatus === 'error') {
+        flag = '<span class="session-item-flag err">Needs transcript</span>';
+      } else {
+        flag = '<span class="session-item-flag">' +
+               (transcriptionLabel(s.transcriptionStatus) || 'Transcribing…') + '</span>';
+      }
     } else if (!sessionHasNote(s)) {
       flag = '<span class="session-item-flag">No note yet</span>';
     }

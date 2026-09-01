@@ -170,8 +170,41 @@
     });
   });
 
+  // ── Note-generation error mapping ────────────────────────────────────────────
+
+  test('noteErrorMessage: every message leads with the transcript being saved', () => {
+    [0, 400, 401, 404, 429, 500, 529, 418].forEach(code => {
+      ok(H.noteErrorMessage(code, '').indexOf('The transcript is saved') === 0,
+         'code ' + code + ' should open by saying the transcript is saved');
+    });
+  });
+  test('noteErrorMessage: auth failures point at the Keys button', () => {
+    ok(H.noteErrorMessage(401, '').indexOf('Keys button') !== -1);
+    ok(H.noteErrorMessage(400, 'invalid x-api-key').indexOf('Keys button') !== -1);
+  });
+  test('noteErrorMessage: an out-of-credit account names the console', () => {
+    ok(H.noteErrorMessage(400, 'Your credit balance is too low').indexOf('console.anthropic.com') !== -1);
+  });
+  test('noteErrorMessage: rate limit, overload, server, and offline are distinct', () => {
+    ok(H.noteErrorMessage(429, '').indexOf('rate-limiting') !== -1);
+    ok(H.noteErrorMessage(529, '').indexOf('overloaded') !== -1);
+    ok(H.noteErrorMessage(500, '').indexOf('server error') !== -1);
+    ok(H.noteErrorMessage(0, '').indexOf('internet connection') !== -1);
+  });
+  test('noteErrorMessage: a model/access failure blames access, not the transcript', () => {
+    ok(H.noteErrorMessage(404, 'model: claude-opus-5').indexOf('Claude API access') !== -1);
+  });
+
   // ── Transcription status vocabulary ──────────────────────────────────────────
 
+  test('transcriptionLabel: a session banked at record start reads as recording', () => {
+    eq(H.transcriptionLabel('recording'), 'Recording…');
+  });
+  test('needsTranscription: a session still recording owes a transcript', () => {
+    // It is banked to history the moment recording starts, so a page death
+    // mid-session leaves a record that resumeUnfinishedWork() can offer back.
+    ok(H.needsTranscription({ hasAudio: true, transcriptionStatus: 'recording', transcript: '' }));
+  });
   test('transcriptionLabel: known states read as progress', () => {
     eq(H.transcriptionLabel('uploading'), 'Uploading audio…');
     eq(H.transcriptionLabel('queued'), 'Queued at AssemblyAI…');

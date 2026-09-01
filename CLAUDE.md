@@ -222,6 +222,63 @@ no matter how old it is, because that audio is the only copy. There is a test na
 "NEVER drops audio for a session without a note" guarding exactly this — if it goes
 red, the safety property is broken.
 
+## Tier 3 — the day two intakes were lost (done — August 31, 2026)
+
+Field incident: five sessions recorded, two intakes lost (40 min and 31 min).
+Tier 2's invariant held — every byte reached IndexedDB — but the invariant only
+covered *durability*, never *readability*. Both failures happened after the audio
+was safely on disk, reading it back out.
+
+Diagnosed from the PHI-free diag log via `recover.html`, not from a repro. Neither
+bug reproduced reliably on the developer's machine (Safari 26.6.2) while both fired
+repeatedly on the physician's (Safari 18.6).
+
+- [x] **`sleep` was in its temporal dead zone at load.** `resumeUnfinishedWork()`
+  runs during initial script execution; `const sleep` was declared ~500 lines
+  later, next to `transcribeSession`. Resuming a job that already had an
+  `assemblyId` reached the poll loop with no preceding `await`, so it threw
+  before the constant initialized — Safari words this "Cannot access uninitialized
+  variable", V8 "Cannot access 'sleep' before initialization". **Every resume on
+  page load died instantly.** This is what lost the 40-minute intake. `sleep` now
+  sits with the other constants at the top of the file.
+- [x] **`getAudioBlob` uploaded truncated files.** Safari returns Blob references
+  from IndexedDB that stop resolving once the producing transaction completes:
+  `.size` still reports correctly, but reading the bytes yields a short result or
+  nothing. Assembling the upload body from one `getAll()` put garbage on the wire
+  — a 750-chunk session uploaded 10.6 MB of an expected ~38 MB, then 114 KB on
+  retry — which AssemblyAI rejects as `File type application/octet-stream (data)`.
+  Each chunk's bytes are now pulled inside that chunk's own transaction, and the
+  assembled length is verified against what the chunks claim before upload; a
+  short read fails locally and loudly instead of becoming a confusing rejection
+  minutes later. **Non-determinism was the signature, not noise.**
+- [x] **Sessions are banked at record start, not at stop.** Chunks land in
+  IndexedDB from second five, but until a session record named them nothing in
+  the app could reach them — a page death mid-recording stranded the entire
+  session invisibly. `persistSession` now writes a `transcriptionStatus:
+  'recording'` entry as soon as the recorder starts, so `resumeUnfinishedWork()`
+  finds it on the next load.
+- [x] **Durations come from the wall clock.** `setInterval` is throttled hard in
+  a backgrounded Safari tab, so a tick counter under-reported long sessions (one
+  16.5-minute recording displayed 8m 21s). That number is stored as the session
+  duration and **drives CPT selection**, making this a billing error rather than a
+  cosmetic one.
+- [x] **A stale note no longer follows the next patient.** `persistSession` reads
+  the SOAP out of the DOM, and only "New Session" cleared those fields — so
+  recording again without clicking it attached the previous patient's note to the
+  new session (and left it on screen during the visit). Starting a recording now
+  clears the note, CPT row, and safety warning.
+- [x] **`recover.html`** — standalone page, additive, no app dependency. Lists
+  every recording in IndexedDB *including orphans the app cannot see*, reports
+  whether each starts with a valid container header, and saves out the raw bytes,
+  a chunk manifest, and the PHI-free diagnostic log. Built to recover the two lost
+  intakes without physical access to the machine; it is also the fastest way to
+  diagnose any future field failure — ask for the diagnostics file first.
+
+**What this cost, and the lesson:** the harness round-trip test proved chunks come
+back *byte-identical and correctly ordered*, which reads like it covers reassembly
+but does not — it never checks that the result is readable, and it runs in one
+browser on one machine. Both Tier 3 bugs lived in that gap.
+
 ## Potential Improvements (Future)
 
 - [ ] Serverless proxy to move both API keys server-side
@@ -254,7 +311,7 @@ Dev-only, zero-dependency. Test cases live in `tests/spec.js` and run in two pla
 
 ```
 cd wcp-scribe
-npm test                     # Node runner (node --test) — 32 cases
+npm test                     # Node runner (node --test) — 70 cases
 python3 -m http.server 8000  # then open http://localhost:8000/tests/harness.html in SAFARI
 ```
 
@@ -263,7 +320,7 @@ the `../helpers.js` load (parent-directory access) and every helper comes up
 undefined; Chrome tolerates it, which can mask the problem. The harness shows an
 explanatory banner instead of a screen of bogus failures when this happens.
 
-Coverage (63 cases): audio-format negotiation (`pickAudioMime`, with Chrome- and
+Coverage (70 cases): audio-format negotiation (`pickAudioMime`, with Chrome- and
 Safari-shaped detectors), mic error mapping, speaker-labeled transcript assembly
 (`buildUtteranceTranscript`), transcription error mapping, session-state predicates,
 **the audio retention rule** (`selectAudioToPrune`), spend estimation, key-shape
@@ -303,6 +360,15 @@ session from the sidebar and click *Transcribe from saved audio*. Nothing is los
 **Credits ran out:** AssemblyAI pauses API access at $0 rather than auto-charging.
 Top up at assemblyai.com/app, then retry the affected sessions from the sidebar. The
 header meter warns below $5 so this should never be a surprise.
+
+**Note generation failed:** Every failure of the Anthropic call is mapped by
+`noteErrorMessage()` (the counterpart to `assemblyErrorMessage`) and each message
+*opens* by saying the transcript is saved, because at that point it always is —
+`transcribeSession` writes the transcript into `scribe_sessions` before it is drawn
+on screen. The rest of the message names the cause: out of credit, rejected key,
+no model access, rate limit, overload, server error, offline. Reopen the session
+from the sidebar and click **Generate SOAP Note** again. A test asserts the
+"transcript is saved" opener for every status code.
 
 **Anthropic API key error:** Key must start with `sk-ant-`. On a 401 the key may be
 invalid or expired — re-enter via the **Keys** button.
