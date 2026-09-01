@@ -319,6 +319,48 @@ nothing was ever recorded.
   runs as the last statements in the file, after every declaration, which makes
   the entire class impossible rather than merely fixed twice. **Keep it there.**
 
+## Tier 3c — the remaining ways a session could be interrupted (done — Aug 31, 2026)
+
+A deliberate audit of everything else that could interrupt or silently lose a
+recording, prompted by "I don't want this to happen again". Six gaps, none of
+which had fired yet except the last, which was self-inflicted.
+
+- [x] **Two tabs no longer destroy each other's work.** `sessions` is a per-tab
+  in-memory copy taken at load, and `saveSessions()` overwrote the whole array
+  from it. Tab A loads, tab B records and saves, tab A saves for any reason at
+  all (a SOAP field losing focus is enough) — and tab B's session is gone, its
+  audio orphaned. A write is now a **merge**: re-read the disk copy and keep, per
+  id, whichever record was written last (`mergeSessions`, `updatedAt` stamped on
+  every mutation). A `storage` listener also converges open tabs live. Verified
+  with two real tabs, not just unit tests.
+- [x] **A failed save shouts.** `saveSessions()` swallowed quota errors and
+  `updateSession` ignored its return value, so once localStorage filled, a
+  transcript would be computed, displayed and never saved, silently. It now warns
+  explicitly and tells her to copy what she needs. Projection at ~4 sessions/day:
+  the 100-session cap lands in ~3 weeks and storage plateaus near 4 MB against
+  Safari's ~5 MB — close enough to matter.
+- [x] **`MediaRecorder.onerror` is handled.** The recorder could fail mid-session
+  and simply stop, saying nothing.
+- [x] **`track.onmute` is handled.** `onended` covered the mic being unplugged or
+  seized, but a track can go *silent while alive* (OS grab, Bluetooth profile
+  switch) and produce a full-length recording of nothing. Warns without stopping,
+  since it is recoverable; `onunmute` clears it.
+- [x] **Chunk-write failures repeat.** The warning fired only on the first
+  failure — one banner 40 minutes ago is a banner she never saw. Now every 12th
+  (about once a minute), with a running count.
+- [x] **The upload no longer holds the whole recording in the JS heap.** The
+  Tier 3 `getAudioBlob` rewrite read every chunk into ArrayBuffers at once: ~41 MB
+  for an hour-long visit, plus a copy when the Blob was built. That is a good way
+  to provoke exactly the memory-pressure tab discard this work exists to prevent,
+  at the worst moment. Each chunk is now re-wrapped as a Blob immediately so the
+  browser can back it with disk.
+
+**Known and not fixable in code:** Safari deletes script-writable storage after
+~7 days without a visit (a long holiday can wipe audio, history and both API
+keys); closing the lid still sleeps the machine even though an active capture
+holds a coreaudiod sleep assertion; and Safari can discard a tab under memory
+pressure, which is what cost 40 minutes on Aug 31.
+
 ## Potential Improvements (Future)
 
 - [ ] Serverless proxy to move both API keys server-side
@@ -351,7 +393,7 @@ Dev-only, zero-dependency. Test cases live in `tests/spec.js` and run in two pla
 
 ```
 cd wcp-scribe
-npm test                     # Node runner (node --test) — 84 cases
+npm test                     # Node runner (node --test) — 91 cases
 python3 -m http.server 8000  # then open http://localhost:8000/tests/harness.html in SAFARI
 ```
 
@@ -360,7 +402,7 @@ the `../helpers.js` load (parent-directory access) and every helper comes up
 undefined; Chrome tolerates it, which can mask the problem. The harness shows an
 explanatory banner instead of a screen of bogus failures when this happens.
 
-Coverage (84 cases): audio-format negotiation (`pickAudioMime`, with Chrome- and
+Coverage (91 cases): audio-format negotiation (`pickAudioMime`, with Chrome- and
 Safari-shaped detectors), mic error mapping, speaker-labeled transcript assembly
 (`buildUtteranceTranscript`), transcription error mapping, session-state predicates,
 **the audio retention rule** (`selectAudioToPrune`), spend estimation, key-shape

@@ -431,6 +431,46 @@ function upsertSession(list, session, cap) {
   return sessions.length > max ? sessions.slice(0, max) : sessions;
 }
 
+// Multi-tab session merge ----------------------------------------------------------
+//
+// localStorage is shared by every tab but `sessions` is a per-tab in-memory copy
+// taken at page load. Two tabs open meant the last one to write clobbered the
+// whole array from its stale snapshot: tab A loads, tab B records and saves, tab
+// A saves for any reason at all (a SOAP field losing focus is enough) and tab B's
+// session is simply gone, its audio orphaned in IndexedDB with nothing naming it.
+//
+// So a write is now a merge, not an overwrite: re-read what is on disk, and for
+// any id present in both, keep whichever record was written most recently.
+// Two tiers, kept apart on purpose. Anything the current code wrote carries a
+// timestamp and always outranks a record that predates `updatedAt` — mixing the
+// two on one scale let a wordy legacy record outrank a freshly written one.
+// 1e15 clears any content score, and stays inside Number.MAX_SAFE_INTEGER once a
+// Date.now() (~1.7e12) is added to it.
+const STAMPED_TIER = 1e15;
+
+function sessionRank(session) {
+  const stamp = Number(session && session.updatedAt) || 0;
+  if (stamp > 0) return STAMPED_TIER + stamp;
+  // Untimestamped records rank against each other by how much work they hold.
+  const chars = String((session && session.transcript) || '').length;
+  return 1 + chars + ((session && session.soap) ? 100000 : 0);
+}
+
+function mergeSessions(mine, theirs, cap) {
+  const byId = new Map();
+  const consider = (s) => {
+    if (!s || s.id == null) return;
+    const existing = byId.get(s.id);
+    if (!existing || sessionRank(s) > sessionRank(existing)) byId.set(s.id, s);
+  };
+  (mine || []).forEach(consider);
+  (theirs || []).forEach(consider);
+  const out = Array.from(byId.values())
+    .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+  const max = cap || 100;
+  return out.length > max ? out.slice(0, max) : out;
+}
+
 // Diagnostics report formatting (PHI-free) --------------------------------------
 //
 // Renders the metadata-only diagnostic log into a copy-pasteable block. Never
@@ -487,6 +527,8 @@ if (typeof module !== 'undefined' && module.exports) {
     parseSOAPResponse,
     isDraftRestorable,
     upsertSession,
+    mergeSessions,
+    sessionRank,
     formatDiagnostics,
   };
 }

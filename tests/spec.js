@@ -173,6 +173,51 @@
     ok(!H.shouldWarnNoSound(undefined));
   });
 
+  // ── Multi-tab session merge ──────────────────────────────────────────────────
+
+  test('mergeSessions: a session only the other tab has is kept', () => {
+    const mine   = [{ id: 1, date: '2026-08-31T10:00:00Z', updatedAt: 100 }];
+    const theirs = [{ id: 2, date: '2026-08-31T11:00:00Z', updatedAt: 100 }];
+    const out = H.mergeSessions(mine, theirs, 100);
+    eq(out.length, 2);
+    // This is the whole point: a blind overwrite used to drop the other tab's work.
+    ok(out.some(s => s.id === 2));
+  });
+  test('mergeSessions: the most recently written copy of an id wins', () => {
+    const mine   = [{ id: 1, date: '2026-08-31T10:00:00Z', updatedAt: 100, transcript: 'stale' }];
+    const theirs = [{ id: 1, date: '2026-08-31T10:00:00Z', updatedAt: 999, transcript: 'fresh' }];
+    eq(H.mergeSessions(mine, theirs, 100)[0].transcript, 'fresh');
+    eq(H.mergeSessions(theirs, mine, 100)[0].transcript, 'fresh');
+  });
+  test('mergeSessions: a stamped record beats a legacy one with no timestamp', () => {
+    const legacy  = [{ id: 1, date: '2026-08-31T10:00:00Z', transcript: 'old copy' }];
+    const stamped = [{ id: 1, date: '2026-08-31T10:00:00Z', updatedAt: 5, transcript: 'new copy' }];
+    eq(H.mergeSessions(legacy, stamped, 100)[0].transcript, 'new copy');
+  });
+  test('mergeSessions: between two legacy records, the one carrying more wins', () => {
+    const thin  = [{ id: 1, date: '2026-08-31T10:00:00Z', transcript: '' }];
+    const rich  = [{ id: 1, date: '2026-08-31T10:00:00Z', transcript: 'a real transcript', soap: { S: 'x' } }];
+    eq(H.mergeSessions(thin, rich, 100)[0].transcript, 'a real transcript');
+    eq(H.mergeSessions(rich, thin, 100)[0].transcript, 'a real transcript');
+  });
+  test('mergeSessions: newest-first order and the cap are preserved', () => {
+    const mk = (id, day) => ({ id, date: '2026-08-' + String(day).padStart(2,'0') + 'T10:00:00Z', updatedAt: id });
+    const out = H.mergeSessions([mk(1,1), mk(3,3)], [mk(2,2), mk(4,4)], 3);
+    eq(out.length, 3);
+    eq(out[0].id, 4);
+    eq(out[2].id, 2);
+  });
+  test('mergeSessions: null and empty inputs are safe', () => {
+    eq(H.mergeSessions(null, null, 100).length, 0);
+    eq(H.mergeSessions([{ id: 1, date: '2026-08-31T10:00:00Z' }], null, 100).length, 1);
+    eq(H.mergeSessions(null, [{ id: 1, date: '2026-08-31T10:00:00Z' }], 100).length, 1);
+  });
+  test('mergeSessions: a record with no id cannot displace real ones', () => {
+    const out = H.mergeSessions([{ date: '2026-08-31T10:00:00Z' }], [{ id: 1, date: '2026-08-31T10:00:00Z' }], 100);
+    eq(out.length, 1);
+    eq(out[0].id, 1);
+  });
+
   // ── Interrupted recordings ───────────────────────────────────────────────────
 
   test('isInterruptedRecording: only a session still claiming to record', () => {

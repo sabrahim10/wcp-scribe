@@ -261,7 +261,12 @@ async function getAudioBlob(sessionId) {
     declared += row.blob.size;
     const buf = await row.blob.arrayBuffer();
     actual += buf.byteLength;
-    parts.push(buf);
+    // Re-wrap as a Blob immediately rather than keeping the ArrayBuffer: an
+    // hour-long visit is ~41 MB, and holding all of it in the JS heap (plus a
+    // copy when the final Blob is built) is a good way to provoke exactly the
+    // memory-pressure tab discard this tier exists to prevent. Blobs can be
+    // backed by disk; each buffer is collectable as soon as it is wrapped.
+    parts.push(new Blob([buf]));
   }
 
   if (!actual) return null;
@@ -296,7 +301,7 @@ function pruneAudio() {
     let changed = false;
     ids.forEach(id => {
       const s = sessions.find(x => x.id === id);
-      if (s && s.hasAudio) { s.hasAudio = false; changed = true; }
+      if (s && s.hasAudio) { s.hasAudio = false; s.updatedAt = Date.now(); changed = true; }
     });
     if (changed) saveSessions();
     diag('audio_pruned', 'count:' + ids.length);
@@ -385,6 +390,18 @@ async function startRecording() {
   }
   if (!audioMime) audioMime = mediaRecorder.mimeType || '';
 
+  // The recorder can fail on its own mid-session. Unhandled, it simply stops and
+  // says nothing — the interrupted banner would catch it on the next load, but
+  // she needs to know now, while the visit is still in the room.
+  mediaRecorder.onerror = (e) => {
+    const name = (e && e.error && e.error.name) || 'error';
+    diag('recorder_failed', name + ' chunks:' + chunkSeq);
+    showError('Recording stopped unexpectedly (' + name + '). Everything captured ' +
+              'so far is saved — press record to start a new recording for the rest ' +
+              'of this visit.');
+    if (isRecording) stopRecording();
+  };
+
   mediaRecorder.ondataavailable = (e) => {
     if (!e.data || !e.data.size) return;
     const seq = chunkSeq++;
@@ -394,9 +411,13 @@ async function startRecording() {
       .catch((err) => {
         chunkErrors++;
         diag('audio_chunk_error', (err && err.name) || 'error');
-        if (chunkErrors === 1) {
-          showError('Warning: this browser is refusing to save audio to disk (storage may be full). ' +
-                    'The session is still recording, but it may not survive a crash — finish and check the note.');
+        // Repeat, not once: a single banner 40 minutes ago is a banner she never
+        // saw. Every 12th failure is about once a minute at a 5s chunk rate.
+        if (chunkErrors === 1 || chunkErrors % 12 === 0) {
+          showError('This browser is refusing to save audio to disk (storage may be full) — ' +
+                    chunkErrors + ' failed write' + (chunkErrors === 1 ? '' : 's') + ' so far. ' +
+                    'The session is still recording, but parts of it are NOT being saved. ' +
+                    'Finish the visit, then check the recording before relying on it.');
         }
       });
   };
@@ -409,6 +430,22 @@ async function startRecording() {
       diag('track_ended');
       showError('The microphone stopped unexpectedly. Recording has been stopped — the audio up to this point is saved.');
       stopRecording();
+    };
+    // A track can go silent without ending: the OS hands the mic to something
+    // else, or a Bluetooth headset switches profile. Recording carries on happily
+    // and produces a full-length file of nothing. Worth interrupting for — but it
+    // is recoverable, so the recording deliberately keeps running.
+    track.onmute = () => {
+      if (!isRecording) return;
+      diag('track_muted');
+      showError('The microphone has gone silent — another app may have taken it, or a ' +
+                'Bluetooth device switched modes. The recording is still running, but ' +
+                'nothing is being heard. Check System Settings ▸ Sound ▸ Input.');
+    };
+    track.onunmute = () => {
+      if (!isRecording) return;
+      diag('track_unmuted');
+      if (document.getElementById('errorMsg').textContent.indexOf('gone silent') !== -1) hideError();
     };
   });
 
@@ -1002,6 +1039,7 @@ async function generateSOAP() {
 
     if (viewing) {
       viewing.soap = readSoapFromDOM();
+      viewing.updatedAt = Date.now();
       saveSessions();
       ['soapS', 'soapO', 'soapA', 'soapP'].forEach(id => document.getElementById(id).removeAttribute('contenteditable'));
       renderSidebar();
@@ -1101,16 +1139,52 @@ function copySection(sectionId, btnEl) {
 
 function findSession(id) { return sessions.find(s => s.id === id) || null; }
 
+// A write is a merge, never a blind overwrite — see mergeSessions() for why.
+// Returns false only when the write itself failed.
 function saveSessions() {
-  try { localStorage.setItem('scribe_sessions', JSON.stringify(sessions)); return true; }
-  catch (e) { diag('persist_error', (e && e.name) || 'error'); return false; }
+  let onDisk = [];
+  try { onDisk = JSON.parse(localStorage.getItem('scribe_sessions') || '[]'); } catch (e) {}
+  sessions = mergeSessions(sessions, onDisk, 100);
+  try {
+    localStorage.setItem('scribe_sessions', JSON.stringify(sessions));
+    storageFullWarned = false;
+    return true;
+  } catch (e) {
+    diag('persist_error', (e && e.name) || 'error');
+    warnStorageFull();
+    return false;
+  }
 }
+
+// A failed write used to be swallowed: the transcript was on screen and simply
+// never saved. Nothing about that is visible, so it has to shout.
+let storageFullWarned = false;
+function warnStorageFull() {
+  if (storageFullWarned) return;
+  storageFullWarned = true;
+  showError('This browser will not save any more sessions — its storage is full. ' +
+            'The audio for this session is still on disk, but the transcript and note ' +
+            'are NOT being saved. Copy anything you need now, then open the recovery ' +
+            'page to save recordings off this machine.');
+}
+
+// Another tab wrote the session list. Take its version, merged with ours, so the
+// two copies converge instead of one silently winning.
+window.addEventListener('storage', (e) => {
+  if (e.key !== 'scribe_sessions') return;
+  let theirs = [];
+  try { theirs = JSON.parse(e.newValue || '[]'); } catch (err) { return; }
+  sessions = mergeSessions(sessions, theirs, 100);
+  diag('sessions_merged_from_tab', 'count:' + sessions.length);
+  renderSidebar();
+});
 
 // Patch fields onto a stored session without disturbing the rest of it.
 function updateSession(id, patch) {
   const s = findSession(id);
   if (!s) return null;
   Object.assign(s, patch);
+  s.updatedAt = Date.now();   // mergeSessions() resolves conflicts by this
   saveSessions();
   return s;
 }
@@ -1235,6 +1309,7 @@ function persistSession(extra) {
     duration:   existing.audioSeconds || timerSeconds || existing.duration || 0,
     transcript: transcript || existing.transcript || '',
     soap:       soap || existing.soap || null,
+    updatedAt:  Date.now(),
   }, extra || {});
 
   sessions = upsertSession(sessions, session, 100);
