@@ -116,6 +116,31 @@ function countWords(text) {
   return words.length;
 }
 
+// Microphone silence warning ------------------------------------------------------
+//
+// Whether a "no sound is reaching the microphone" warning is actually justified.
+//
+// The level meter runs on requestAnimationFrame off an AnalyserNode, and both
+// stop reporting for reasons that have nothing to do with the microphone: rAF is
+// paused outright while the tab is hidden, and a suspended AudioContext returns
+// zeros forever (Safari suspends any context not created inside a user gesture,
+// which this one never is — startRecording awaits getUserMedia first). Reading
+// "no samples" as "no sound" is how a 19-minute session carrying 187 turns of
+// real conversation was told its mic was dead, 20 seconds in.
+//
+// So the warning requires positive evidence: the meter must have actually
+// sampled, the audio graph must be running, and the page must be visible.
+function shouldWarnNoSound(state) {
+  const s = state || {};
+  if (s.sawSound) return false;          // sound was heard; nothing to warn about
+  if (s.hidden) return false;            // rAF is paused — we cannot know
+  if (!(s.meterTicks > 0)) return false; // meter never sampled — we cannot know
+  // 'none' means the meter could not be built at all, which is already handled
+  // by treating sound as heard; any state other than running means not measuring.
+  if (s.ctxState && s.ctxState !== 'running') return false;
+  return true;
+}
+
 // Transcription — error mapping --------------------------------------------------
 //
 // Every message ends by saying the audio is safe, because it always is: the
@@ -440,6 +465,7 @@ if (typeof module !== 'undefined' && module.exports) {
     micErrorMessage,
     buildUtteranceTranscript,
     countWords,
+    shouldWarnNoSound,
     assemblyErrorMessage,
     noteErrorMessage,
     transcriptionLabel,

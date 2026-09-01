@@ -148,6 +148,31 @@
     eq(H.buildUtteranceTranscript([{ speaker: 'A', text: '  ' }], 'fallback text'), 'fallback text');
   });
 
+  // ── Microphone silence warning ───────────────────────────────────────────────
+
+  test('shouldWarnNoSound: warns only on measured silence', () => {
+    ok(H.shouldWarnNoSound({ sawSound: false, meterTicks: 200, hidden: false, ctxState: 'running' }));
+  });
+  test('shouldWarnNoSound: never warns once sound has been heard', () => {
+    ok(!H.shouldWarnNoSound({ sawSound: true, meterTicks: 200, hidden: false, ctxState: 'running' }));
+  });
+  test('shouldWarnNoSound: a hidden tab pauses rAF — silence cannot be known', () => {
+    // The Aug 31 false alarm: recording fine, physician switched to her EHR.
+    ok(!H.shouldWarnNoSound({ sawSound: false, meterTicks: 40, hidden: true, ctxState: 'running' }));
+  });
+  test('shouldWarnNoSound: a meter that never sampled proves nothing', () => {
+    ok(!H.shouldWarnNoSound({ sawSound: false, meterTicks: 0, hidden: false, ctxState: 'running' }));
+  });
+  test('shouldWarnNoSound: a suspended AudioContext only ever reports zeros', () => {
+    ok(!H.shouldWarnNoSound({ sawSound: false, meterTicks: 5, hidden: false, ctxState: 'suspended' }));
+    ok(!H.shouldWarnNoSound({ sawSound: false, meterTicks: 5, hidden: false, ctxState: 'closed' }));
+  });
+  test('shouldWarnNoSound: missing state is never a reason to warn', () => {
+    ok(!H.shouldWarnNoSound({}));
+    ok(!H.shouldWarnNoSound(null));
+    ok(!H.shouldWarnNoSound(undefined));
+  });
+
   // ── Interrupted recordings ───────────────────────────────────────────────────
 
   test('isInterruptedRecording: only a session still claiming to record', () => {

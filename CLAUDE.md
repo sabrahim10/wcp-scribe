@@ -299,6 +299,19 @@ nothing was ever recorded.
   group under Today / Yesterday / "Aug 28", most recent day open, the rest
   folded; a closed day carrying interrupted or untranscribed sessions shows a
   red count so nothing hides behind a fold.
+- [x] **The "no sound" warning needs evidence now.** It fired 20s into a
+  19-minute session that contains 187 turns of real conversation, while a 45 KB
+  audio chunk had already been written. The meter runs on requestAnimationFrame
+  off an AnalyserNode and **both stop reporting for reasons unrelated to the
+  microphone**: rAF is paused outright in a hidden tab (she switched to her EHR),
+  and Safari suspends any AudioContext not created inside a user gesture — which
+  this one never is, since `startRecording` awaits `getUserMedia` first, spending
+  the gesture. Zeros from a suspended graph are indistinguishable from a dead mic.
+  `shouldWarnNoSound()` now requires positive evidence — the meter actually
+  sampled, the graph is running, the page is visible — and otherwise waits and
+  re-checks rather than accusing. The context is also resumed on creation and on
+  `visibilitychange`. A false alarm here is worse than none: it trains her to
+  distrust a warning that will one day be real.
 - [x] **Init moved to the end of `app.js`.** The `sleep` temporal-dead-zone bug
   was not a one-off: adding `openDays` for the sidebar reproduced it *immediately*
   ("Cannot access 'openDaysSeeded' before initialization"), caught only because
@@ -338,7 +351,7 @@ Dev-only, zero-dependency. Test cases live in `tests/spec.js` and run in two pla
 
 ```
 cd wcp-scribe
-npm test                     # Node runner (node --test) — 78 cases
+npm test                     # Node runner (node --test) — 84 cases
 python3 -m http.server 8000  # then open http://localhost:8000/tests/harness.html in SAFARI
 ```
 
@@ -347,7 +360,7 @@ the `../helpers.js` load (parent-directory access) and every helper comes up
 undefined; Chrome tolerates it, which can mask the problem. The harness shows an
 explanatory banner instead of a screen of bogus failures when this happens.
 
-Coverage (78 cases): audio-format negotiation (`pickAudioMime`, with Chrome- and
+Coverage (84 cases): audio-format negotiation (`pickAudioMime`, with Chrome- and
 Safari-shaped detectors), mic error mapping, speaker-labeled transcript assembly
 (`buildUtteranceTranscript`), transcription error mapping, session-state predicates,
 **the audio retention rule** (`selectAudioToPrune`), spend estimation, key-shape

@@ -46,6 +46,7 @@ let audioCtx      = null;
 let analyserNode  = null;
 let meterRAF      = null;
 let sawSound      = false;
+let meterTicks    = 0;    // samples actually taken — see checkSilence()
 let silenceTimer  = null;
 
 // Transcription. A run is deliberately never cancelled: once audio is submitted the
@@ -116,6 +117,14 @@ function copyDiagnostics() {
 // A close mid-recording still keeps every chunk already flushed to IndexedDB.
 window.addEventListener('pagehide', () => {
   if (isRecording) diag('pagehide_recording', 'chunks:' + chunkSeq);
+});
+
+// The recording itself is unaffected by backgrounding, but the AudioContext
+// behind the level meter is suspended, so it comes back reporting silence.
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && isRecording && audioCtx && audioCtx.state === 'suspended') {
+    audioCtx.resume().catch(() => {});
+  }
 });
 
 // ── Auth / settings ──────────────────────────────────────────────────────────
@@ -333,6 +342,7 @@ async function startRecording() {
   chunkSeq    = 0;
   chunkErrors = 0;
   sawSound    = false;
+  meterTicks  = 0;
   isRecording = true;
   // Before the record-start persist below, or this session's history entry is
   // written carrying the previous recording's duration.
@@ -460,13 +470,7 @@ async function startRecording() {
   // If nothing at all registers on the meter early on, the wrong input device is
   // almost certainly selected. Say so once, then stop nagging.
   clearTimeout(silenceTimer);
-  silenceTimer = setTimeout(() => {
-    if (isRecording && !sawSound) {
-      diag('no_sound_detected');
-      showError('No sound is reaching the microphone. Check the input device in ' +
-                'System Settings ▸ Sound ▸ Input — the recording is still running.');
-    }
-  }, SILENCE_HINT_MS);
+  silenceTimer = setTimeout(checkSilence, SILENCE_HINT_MS);
 }
 
 // `onFinished` runs once the recorder has flushed and the session is safely in
@@ -535,6 +539,34 @@ function releaseStream() {
 // repaints are gated to ~12fps, so this stays far cheaper than the per-frame
 // height mutation that used to spin the fan up.
 
+// Only warn about a silent microphone when silence was actually *measured*.
+//
+// The meter is driven by requestAnimationFrame off an AnalyserNode, and both can
+// stop reporting while the recording is perfectly fine: rAF is paused outright
+// in a hidden tab, and a suspended AudioContext returns zeros. Treating "no
+// samples" as "no sound" is how a 19-minute session containing 187 turns of real
+// conversation got told the mic was dead, 20 seconds in, right as the physician
+// switched to her EHR. Absence of evidence is not evidence of silence — so when
+// the meter has nothing to say, the check waits and asks again instead.
+function checkSilence() {
+  if (!isRecording || sawSound) return;
+
+  if (shouldWarnNoSound({
+        sawSound, meterTicks, hidden: document.hidden,
+        ctxState: audioCtx ? audioCtx.state : null,
+      })) {
+    diag('no_sound_detected', 'ticks:' + meterTicks);
+    showError('No sound is reaching the microphone. Check the input device in ' +
+              'System Settings ▸ Sound ▸ Input — the recording is still running.');
+    return;   // said once; the meter clears it if sound arrives
+  }
+
+  diag('no_sound_check_deferred',
+       'ticks:' + meterTicks + ' hidden:' + document.hidden +
+       ' ctx:' + (audioCtx ? audioCtx.state : 'none'));
+  silenceTimer = setTimeout(checkSilence, SILENCE_HINT_MS);
+}
+
 function prefersReducedMotion() {
   try { return window.matchMedia('(prefers-reduced-motion: reduce)').matches; }
   catch (e) { return false; }
@@ -550,6 +582,12 @@ function startMeter(stream) {
   }
   try {
     audioCtx = new Ctx();
+    // Safari hands back a suspended context whenever it was not created inside
+    // a user gesture — and it never is here, because startRecording() awaits
+    // getUserMedia() first, which spends the gesture. A suspended context feeds
+    // the analyser nothing but zeros forever, which is indistinguishable from a
+    // dead microphone and is how a working recording got flagged "no sound".
+    if (audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
     const source = audioCtx.createMediaStreamSource(stream);
     analyserNode = audioCtx.createAnalyser();
     analyserNode.fftSize = 64;
@@ -571,6 +609,7 @@ function startMeter(stream) {
     meterRAF = requestAnimationFrame(tick);
     if (now - last < METER_MS) return;
     last = now;
+    meterTicks++;
     analyserNode.getByteFrequencyData(bins);
     let peak = 0;
     for (let i = 0; i < bars.length; i++) {
