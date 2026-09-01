@@ -19,6 +19,14 @@ let transcript  = '';
 let timerInterval = null;
 let timerSeconds  = 0;
 let timerStartedAt = 0;   // wall-clock start; setInterval ticks are throttled
+
+// Which day folders are open in the sidebar. Declared up here, not beside
+// renderSidebar, because renderSidebar() runs during initial script execution —
+// a `const` further down the file is still in its temporal dead zone at that
+// point and the sidebar dies with "Cannot access 'openDaysSeeded' before
+// initialization". Same trap that took out `sleep` and cost a 40-minute intake.
+const openDays = new Set();
+let openDaysSeeded = false;
 let soapData    = null;
 let sessions    = JSON.parse(localStorage.getItem('scribe_sessions') || '[]');
 let viewMode    = false;
@@ -97,21 +105,6 @@ function copyDiagnostics() {
     setTimeout(() => { btn.textContent = prev; }, 2000);
   });
 }
-
-// ── Init ─────────────────────────────────────────────────────────────────────
-
-try { diagLog = JSON.parse(localStorage.getItem(DIAG_KEY) || '[]'); } catch (e) { diagLog = []; }
-diag('app_load', 'mime:' + (pickAudioMime(mimeSupported) || 'default'));
-
-if (hasKeys()) {
-  showMain();
-  maybeOfferRestore();
-  resumeUnfinishedWork();
-} else {
-  prefillSetup();
-}
-renderSidebar();
-renderCredits();
 
 // Hand-edits to the SOAP fields are saved as soon as the field loses focus —
 // closing the tab without clicking New Session no longer drops them.
@@ -457,6 +450,11 @@ async function startRecording() {
     const m = String(Math.floor(timerSeconds / 60)).padStart(2, '0');
     const s = String(timerSeconds % 60).padStart(2, '0');
     document.getElementById('timer').textContent = m + ':' + s;
+    // Keep the stored duration roughly current so that if this recording dies
+    // without a stop, the interrupted banner can say how much was captured.
+    if (timerSeconds && timerSeconds % 30 === 0 && currentSessionId) {
+      updateSession(currentSessionId, { duration: timerSeconds });
+    }
   }, 1000);
 
   // If nothing at all registers on the meter early on, the wrong input device is
@@ -752,7 +750,12 @@ function retryTranscription(sessionId) {
 // submitted to AssemblyAI (poll it again — the result is waiting server-side), or
 // one that has audio but never got a transcript at all.
 function resumeUnfinishedWork() {
-  const pending = sessions.filter(s => needsTranscription(s));
+  // Interrupted recordings are handled first and separately: they are the only
+  // case where the physician may still be able to act on it in the room.
+  const interrupted = findInterruptedSessions(sessions);
+  if (interrupted.length) showInterruptedBanner(interrupted);
+
+  const pending = sessions.filter(s => needsTranscription(s) && !isInterruptedRecording(s));
   if (!pending.length) return;
   diag('resume_pending', 'count:' + pending.length);
   const banner = document.getElementById('pendingBanner');
@@ -768,6 +771,55 @@ function resumeUnfinishedWork() {
     banner.dataset.ids = stalled.map(s => s.id).join(',');
     banner.classList.remove('hidden');
   }
+}
+
+// Names the time and how much was captured, because "a recording was
+// interrupted" is not actionable but "started 1:56 PM, 19 minutes" is.
+function showInterruptedBanner(list) {
+  diag('resume_interrupted', 'count:' + list.length);
+  const banner = document.getElementById('interruptedBanner');
+  const el = document.getElementById('interruptedBannerText');
+
+  if (list.length === 1) {
+    const s = list[0];
+    const started = new Date(s.date).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+    const dur = formatDuration(s.duration);
+    el.textContent = 'A recording started at ' + started + ' stopped before it was finished' +
+      (dur ? ', after ' + dur : '') + '. Everything captured up to that point is saved. ' +
+      'If that visit is still going, press record now to capture the rest.';
+  } else {
+    el.textContent = list.length + ' recordings stopped before they were finished. ' +
+      'Everything captured is saved and can be transcribed.';
+  }
+  banner.dataset.ids = list.map(s => s.id).join(',');
+  banner.classList.remove('hidden');
+}
+
+function bannerIds(id) {
+  const banner = document.getElementById(id);
+  const ids = (banner.dataset.ids || '').split(',').filter(Boolean).map(Number);
+  banner.classList.add('hidden');
+  return ids;
+}
+
+function transcribeInterrupted() {
+  const ids = bannerIds('interruptedBanner');
+  // Leave 'recording' behind first, or these come back as interrupted forever.
+  ids.forEach(id => updateSession(id, { transcriptionStatus: 'queued' }));
+  renderSidebar();
+  ids.forEach(id => transcribeSession(id));
+}
+
+function dismissInterrupted() {
+  const ids = bannerIds('interruptedBanner');
+  // Nothing is deleted — the session just stops claiming to be live. It stays in
+  // the sidebar flagged for transcription and can be run whenever.
+  ids.forEach(id => updateSession(id, {
+    transcriptionStatus: 'error',
+    transcriptionError: 'This recording was interrupted before it finished. ' +
+      'The audio captured up to that point is saved — transcribe it whenever you like.',
+  }));
+  renderSidebar();
 }
 
 function transcribePending() {
@@ -1036,41 +1088,84 @@ function formatDuration(s) {
   return m > 0 ? `${m}m ${String(sec).padStart(2, '0')}s` : `${sec}s`;
 }
 
+function renderSessionItem(s) {
+  const d       = new Date(s.date);
+  const timeStr = d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+  const preview = s.transcript
+    ? s.transcript.slice(0, 50).trim().replace(/</g, '&lt;') + (s.transcript.length > 50 ? '…' : '')
+    : (s.hasAudio ? 'Audio saved — no transcript yet' : 'No transcript');
+  const dur = formatDuration(s.duration);
+
+  let flag = '';
+  if (isInterruptedRecording(s)) {
+    flag = '<span class="session-item-flag err">Interrupted</span>';
+  } else if (needsTranscription(s)) {
+    if (s.transcriptionStatus === 'error') {
+      flag = '<span class="session-item-flag err">Needs transcript</span>';
+    } else {
+      flag = '<span class="session-item-flag">' +
+             (transcriptionLabel(s.transcriptionStatus) || 'Transcribing…') + '</span>';
+    }
+  } else if (!sessionHasNote(s)) {
+    flag = '<span class="session-item-flag">No note yet</span>';
+  }
+
+  return `<div class="session-item" data-id="${s.id}" onclick="viewSession(${s.id})">
+    <div class="session-item-meta">
+      <span class="session-item-date">${timeStr}</span>
+      <span>${flag}${dur ? `<span class="session-item-dur">${dur}</span>` : ''}</span>
+    </div>
+    <div class="session-item-preview">${preview}</div>
+  </div>`;
+}
+
 function renderSidebar() {
   const list = document.getElementById('sessionList');
   if (!sessions.length) {
     list.innerHTML = '<div class="session-empty">Sessions save here automatically when you stop recording</div>';
     return;
   }
-  list.innerHTML = sessions.map(s => {
-    const d       = new Date(s.date);
-    const dateStr = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-    const timeStr = d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
-    const preview = s.transcript
-      ? s.transcript.slice(0, 50).trim().replace(/</g, '&lt;') + (s.transcript.length > 50 ? '…' : '')
-      : (s.hasAudio ? 'Audio saved — no transcript yet' : 'No transcript');
-    const dur = formatDuration(s.duration);
 
-    let flag = '';
-    if (needsTranscription(s)) {
-      if (s.transcriptionStatus === 'error') {
-        flag = '<span class="session-item-flag err">Needs transcript</span>';
-      } else {
-        flag = '<span class="session-item-flag">' +
-               (transcriptionLabel(s.transcriptionStatus) || 'Transcribing…') + '</span>';
-      }
-    } else if (!sessionHasNote(s)) {
-      flag = '<span class="session-item-flag">No note yet</span>';
-    }
+  const groups = groupSessionsByDay(sessions);
 
-    return `<div class="session-item" data-id="${s.id}" onclick="viewSession(${s.id})">
-      <div class="session-item-meta">
-        <span class="session-item-date">${dateStr} · ${timeStr}</span>
-        <span>${flag}${dur ? `<span class="session-item-dur">${dur}</span>` : ''}</span>
-      </div>
-      <div class="session-item-preview">${preview}</div>
+  // Open the most recent day on first render — that is almost always the day
+  // being worked on. Everything older stays folded until asked for.
+  if (!openDaysSeeded) {
+    if (groups.length) openDays.add(groups[0].key);
+    openDaysSeeded = true;
+  }
+  // Never hide the session currently on screen inside a closed folder.
+  if (viewMode && viewingSessionId) {
+    const active = findSession(viewingSessionId);
+    if (active) openDays.add(dayKey(active.date));
+  }
+
+  list.innerHTML = groups.map(g => {
+    const open  = openDays.has(g.key);
+    const needs = g.sessions.filter(s => isInterruptedRecording(s) || needsTranscription(s)).length;
+    const badge = needs && !open
+      ? `<span class="session-day-badge" title="${needs} need attention">${needs}</span>` : '';
+    return `<div class="session-day">
+      <button class="session-day-header${open ? ' open' : ''}" onclick="toggleDay('${g.key}')"
+              aria-expanded="${open}">
+        <span class="session-day-chevron" aria-hidden="true">›</span>
+        <span class="session-day-label">${dayLabel(g.date)}</span>
+        ${badge}<span class="session-day-count">${g.sessions.length}</span>
+      </button>
+      ${open ? `<div class="session-day-items">${g.sessions.map(renderSessionItem).join('')}</div>` : ''}
     </div>`;
   }).join('');
+}
+
+function toggleDay(key) {
+  if (openDays.has(key)) openDays.delete(key);
+  else openDays.add(key);
+  renderSidebar();
+  // Re-mark the active item; renderSidebar rebuilds the list from scratch.
+  if (viewMode && viewingSessionId) {
+    const item = document.querySelector('.session-item[data-id="' + viewingSessionId + '"]');
+    if (item) item.classList.add('active');
+  }
 }
 
 // The SOAP note as currently shown/edited on screen, or null if there isn't one.
@@ -1412,3 +1507,27 @@ function hideError() {
   const diagBtn = document.getElementById('copyDiagBtn');
   if (diagBtn) diagBtn.classList.add('hidden');
 }
+
+
+// ── Init ─────────────────────────────────────────────────────────────────────
+//
+// Deliberately the LAST thing in this file. index.html loads app.js at the end
+// of <body>, so the DOM is ready either way — but running init from the middle
+// of the file meant any `const`/`let` declared below it was still in its
+// temporal dead zone when init touched it. That trap cost a 40-minute intake
+// (`sleep`) and then immediately caught the sidebar's `openDays` too. Keeping
+// init at the bottom makes the whole class of bug impossible: every declaration
+// in this file is initialized before a single line of it runs.
+
+try { diagLog = JSON.parse(localStorage.getItem(DIAG_KEY) || '[]'); } catch (e) { diagLog = []; }
+diag('app_load', 'mime:' + (pickAudioMime(mimeSupported) || 'default'));
+
+if (hasKeys()) {
+  showMain();
+  maybeOfferRestore();
+  resumeUnfinishedWork();
+} else {
+  prefillSetup();
+}
+renderSidebar();
+renderCredits();

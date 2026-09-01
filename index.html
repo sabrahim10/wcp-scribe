@@ -71,6 +71,18 @@
       </div>
 
       <!-- Recorded sessions still owing a transcript -->
+      <!-- A recording that stopped without a stop: crashed or discarded tab.
+           Louder than the pending banner because the visit may still be in the
+           room, and restarting now is the difference between losing 30 seconds
+           and losing the rest of the hour. -->
+      <div class="interrupted-banner hidden" id="interruptedBanner" data-ids="">
+        <div class="interrupted-banner-text" id="interruptedBannerText"></div>
+        <div class="restore-banner-actions">
+          <button class="restore-btn" onclick="transcribeInterrupted()">Transcribe what was captured</button>
+          <button class="restore-btn ghost" onclick="dismissInterrupted()">Dismiss</button>
+        </div>
+      </div>
+
       <div class="restore-banner hidden" id="pendingBanner" data-ids="">
         <span id="pendingBannerText">A recorded session has no transcript yet.</span>
         <div class="restore-banner-actions">

@@ -279,6 +279,33 @@ back *byte-identical and correctly ordered*, which reads like it covers reassemb
 but does not — it never checks that the result is readable, and it runs in one
 browser on one machine. Both Tier 3 bugs lived in that gap.
 
+## Tier 3b — telling her when a recording dies (done — August 31, 2026)
+
+Tier 3 made an interrupted session *visible afterward*. It did not tell her in
+the moment, which is the part that mattered: on Aug 31 a tab was discarded 21
+minutes into a one-hour intake, the screen came back blank, and the remaining
+~40 minutes were never captured by anything. Nothing was recoverable because
+nothing was ever recorded.
+
+- [x] **Interrupted-recording banner.** A session sits in `transcriptionStatus:
+  'recording'` from record start until a clean stop moves it to 'queued', so one
+  still in that state on a later load means the recorder died. The banner names
+  the start time and how much was captured, and says to press record again if
+  the visit is still going. "Transcribe what was captured" runs it; "Dismiss"
+  only clears the live claim — the audio and the session stay, flagged for
+  transcription. The stored duration is refreshed every 30s while recording so
+  the banner can be specific.
+- [x] **Sidebar sessions fold by day.** A flat list stopped scaling. Sessions
+  group under Today / Yesterday / "Aug 28", most recent day open, the rest
+  folded; a closed day carrying interrupted or untranscribed sessions shows a
+  red count so nothing hides behind a fold.
+- [x] **Init moved to the end of `app.js`.** The `sleep` temporal-dead-zone bug
+  was not a one-off: adding `openDays` for the sidebar reproduced it *immediately*
+  ("Cannot access 'openDaysSeeded' before initialization"), caught only because
+  the change was checked in a real browser — `npm test` cannot see it. Init now
+  runs as the last statements in the file, after every declaration, which makes
+  the entire class impossible rather than merely fixed twice. **Keep it there.**
+
 ## Potential Improvements (Future)
 
 - [ ] Serverless proxy to move both API keys server-side
@@ -311,7 +338,7 @@ Dev-only, zero-dependency. Test cases live in `tests/spec.js` and run in two pla
 
 ```
 cd wcp-scribe
-npm test                     # Node runner (node --test) — 70 cases
+npm test                     # Node runner (node --test) — 78 cases
 python3 -m http.server 8000  # then open http://localhost:8000/tests/harness.html in SAFARI
 ```
 
@@ -320,7 +347,7 @@ the `../helpers.js` load (parent-directory access) and every helper comes up
 undefined; Chrome tolerates it, which can mask the problem. The harness shows an
 explanatory banner instead of a screen of bogus failures when this happens.
 
-Coverage (70 cases): audio-format negotiation (`pickAudioMime`, with Chrome- and
+Coverage (78 cases): audio-format negotiation (`pickAudioMime`, with Chrome- and
 Safari-shaped detectors), mic error mapping, speaker-labeled transcript assembly
 (`buildUtteranceTranscript`), transcription error mapping, session-state predicates,
 **the audio retention rule** (`selectAudioToPrune`), spend estimation, key-shape

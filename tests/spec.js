@@ -148,6 +148,58 @@
     eq(H.buildUtteranceTranscript([{ speaker: 'A', text: '  ' }], 'fallback text'), 'fallback text');
   });
 
+  // ── Interrupted recordings ───────────────────────────────────────────────────
+
+  test('isInterruptedRecording: only a session still claiming to record', () => {
+    ok(H.isInterruptedRecording({ transcriptionStatus: 'recording' }));
+    ok(!H.isInterruptedRecording({ transcriptionStatus: 'queued' }));
+    ok(!H.isInterruptedRecording({ transcriptionStatus: 'completed' }));
+    ok(!H.isInterruptedRecording(null));
+  });
+  test('findInterruptedSessions: picks them out of a mixed list', () => {
+    const list = [
+      { id: 1, transcriptionStatus: 'completed' },
+      { id: 2, transcriptionStatus: 'recording' },
+      { id: 3, transcriptionStatus: 'error' },
+      { id: 4, transcriptionStatus: 'recording' },
+    ];
+    eq(H.findInterruptedSessions(list).map(s => s.id).join(','), '2,4');
+    eq(H.findInterruptedSessions([]).length, 0);
+    eq(H.findInterruptedSessions(null).length, 0);
+  });
+
+  // ── Session grouping by day ──────────────────────────────────────────────────
+
+  test('groupSessionsByDay: same local day groups together, order preserved', () => {
+    const list = [
+      { id: 3, date: '2026-08-31T20:30:00.000Z' },
+      { id: 2, date: '2026-08-31T15:30:00.000Z' },
+      { id: 1, date: '2026-08-30T15:30:00.000Z' },
+    ];
+    const groups = H.groupSessionsByDay(list);
+    eq(groups.length, 2);
+    eq(groups[0].sessions.length, 2);
+    eq(groups[1].sessions.length, 1);
+    // Newest day first, matching the order sessions arrive in.
+    ok(groups[0].sessions[0].id === 3);
+  });
+  test('groupSessionsByDay: tolerates an empty or missing list', () => {
+    eq(H.groupSessionsByDay([]).length, 0);
+    eq(H.groupSessionsByDay(null).length, 0);
+  });
+  test('dayKey: an unparseable date does not collapse into a real day', () => {
+    eq(H.dayKey('not a date'), 'undated');
+    eq(H.dayKey(undefined), 'undated');
+  });
+  test('dayLabel: today, yesterday, older, and another year', () => {
+    const now = new Date(2026, 7, 31, 12, 0, 0);
+    eq(H.dayLabel(new Date(2026, 7, 31, 9, 0, 0).toISOString(), now), 'Today');
+    eq(H.dayLabel(new Date(2026, 7, 30, 9, 0, 0).toISOString(), now), 'Yesterday');
+    eq(H.dayLabel(new Date(2026, 7, 28, 9, 0, 0).toISOString(), now), 'Aug 28');
+    eq(H.dayLabel(new Date(2025, 11, 3, 9, 0, 0).toISOString(), now), 'Dec 3, 2025');
+    eq(H.dayLabel('nonsense', now), 'Undated');
+  });
+
   // ── Transcript word count ────────────────────────────────────────────────────
 
   test('countWords: speaker labels are not counted as spoken words', () => {

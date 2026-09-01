@@ -223,6 +223,68 @@ function sessionHasNote(session) {
   });
 }
 
+// Interrupted recordings ---------------------------------------------------------
+//
+// A session is written to history the moment recording starts, carrying
+// `transcriptionStatus: 'recording'`. A clean stop moves it to 'queued'. So a
+// session still sitting in 'recording' on a later page load means the recorder
+// died without stopping — a crashed or discarded tab.
+//
+// This matters more than it sounds: on Aug 31, 2026 a tab was reloaded 21
+// minutes into a one-hour intake and nothing said so. The screen came back
+// blank, the physician was with a patient, and the remaining ~40 minutes were
+// never captured by anything. Detecting this is what turns a 40-minute loss into
+// a 30-second one.
+function isInterruptedRecording(session) {
+  return !!session && session.transcriptionStatus === 'recording';
+}
+
+function findInterruptedSessions(sessions) {
+  return (sessions || []).filter(isInterruptedRecording);
+}
+
+// Session grouping -----------------------------------------------------------------
+//
+// The sidebar is a flat list, which stops working once there are more than a
+// couple of weeks of visits in it. Sessions arrive newest-first, so grouping in
+// encounter order keeps the days in that order too.
+function dayKey(dateISO) {
+  const d = new Date(dateISO);
+  if (isNaN(d.getTime())) return 'undated';
+  return d.getFullYear() + '-' +
+         String(d.getMonth() + 1).padStart(2, '0') + '-' +
+         String(d.getDate()).padStart(2, '0');
+}
+
+function groupSessionsByDay(sessions) {
+  const groups = [];
+  const byKey = new Map();
+  (sessions || []).forEach(s => {
+    const key = dayKey(s && s.date);
+    if (!byKey.has(key)) {
+      const g = { key, date: s && s.date, sessions: [] };
+      byKey.set(key, g);
+      groups.push(g);
+    }
+    byKey.get(key).sessions.push(s);
+  });
+  return groups;
+}
+
+// "Today" / "Yesterday" / "Aug 28" / "Dec 3, 2025". `now` is injectable so this
+// is testable without freezing the clock.
+function dayLabel(dateISO, now) {
+  const d = new Date(dateISO);
+  if (isNaN(d.getTime())) return 'Undated';
+  const ref = now ? new Date(now) : new Date();
+  const midnight = (x) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+  const days = Math.round((midnight(ref) - midnight(d)) / 86400000);
+  if (days === 0) return 'Today';
+  if (days === 1) return 'Yesterday';
+  const base = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+  return d.getFullYear() === ref.getFullYear() ? base : base + ', ' + d.getFullYear();
+}
+
 // Audio retention ----------------------------------------------------------------
 //
 // Recordings are large, so they cannot accumulate forever — but the rule is
@@ -383,6 +445,11 @@ if (typeof module !== 'undefined' && module.exports) {
     transcriptionLabel,
     needsTranscription,
     sessionHasNote,
+    isInterruptedRecording,
+    findInterruptedSessions,
+    dayKey,
+    groupSessionsByDay,
+    dayLabel,
     selectAudioToPrune,
     estimateCost,
     creditStatus,
