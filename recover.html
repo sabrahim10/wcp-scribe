@@ -228,13 +228,34 @@ function status(sid, msg) {
   if (el) el.textContent = msg;
 }
 
+// Safari hands back Blob references from IndexedDB that stop resolving once the
+// transaction that produced them is gone: .size still reports correctly, but
+// reading the bytes yields nothing, so assembling them later gives a 0-byte
+// file. Each chunk is therefore re-read by key and its bytes pulled immediately,
+// while that chunk's own transaction is still alive. Slower than one getAll,
+// and it is the difference between a recording and an empty file.
 async function saveSession(sid) {
-  status(sid, 'Gathering the audio — this can take a minute for a long session…');
+  status(sid, 'Gathering the audio…');
   try {
-    const rows = await getRows(db, sid);
-    const blob = new Blob(rows.map(r => r.blob), { type: 'application/octet-stream' });
-    saveBlob(blob, 'scribe-' + sid + '.bin');
-    status(sid, 'Saved to Downloads (' + (blob.size / 1048576).toFixed(1) + ' MB).');
+    const seqs = (await getRows(db, sid)).map(r => r.seq);
+    const parts = [];
+    let bytes = 0;
+    for (let i = 0; i < seqs.length; i++) {
+      const row = await getChunk(db, sid, seqs[i]);
+      if (row && row.blob) {
+        const buf = await row.blob.arrayBuffer();
+        bytes += buf.byteLength;
+        parts.push(buf);
+      }
+      if (i % 25 === 0) status(sid, 'Gathering the audio… piece ' + (i + 1) + ' of ' + seqs.length);
+    }
+    if (!bytes) {
+      status(sid, 'Could not read the audio bytes for this recording — nothing was saved.');
+      return;
+    }
+    saveBlob(new Blob(parts, { type: 'application/octet-stream' }), 'scribe-' + sid + '.bin');
+    status(sid, 'Saved to Downloads — ' + (bytes / 1048576).toFixed(1) + ' MB from ' +
+                parts.length + ' of ' + seqs.length + ' pieces.');
   } catch (e) {
     status(sid, 'Could not save: ' + String((e && e.message) || e));
   }
